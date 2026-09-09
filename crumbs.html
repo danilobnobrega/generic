@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light" />
+    <title>GENERIC — Crumbs</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap" />
+    <style>
+      * { box-sizing: border-box; margin: 0; }
+      html, body { height: 100%; }
+      body { background: #ecebe4; overflow: hidden; font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace; color: #15150e; }
+      #webgl { position: fixed; inset: 0; display: block; }
+
+      .note {
+        position: fixed; left: 22px; top: 20px; z-index: 3;
+        font-size: 12px; max-width: 46ch; line-height: 1.5;
+      }
+
+      .cookie {
+        position: fixed; left: 0; right: 0; bottom: 0; z-index: 5;
+        background: #15150e; color: #ecebe4;
+        font-size: 12px; line-height: 1.45;
+        padding: 10px 18px;
+        display: flex; align-items: center; gap: 12px 20px; flex-wrap: wrap;
+      }
+      .cookie p { margin: 0; max-width: 54ch; }
+      .cookie .btns { margin-left: auto; display: flex; gap: 8px; }
+      .cookie button {
+        font: inherit; font-size: 11px;
+        background: transparent; color: #ecebe4;
+        border: 1px solid #ecebe4; padding: 5px 9px; cursor: pointer;
+      }
+      .cookie button:hover { background: #ecebe4; color: #15150e; }
+    </style>
+  </head>
+  <body>
+    <canvas id="webgl"></canvas>
+
+    <p class="note" id="hint">Choose. Something falls.</p>
+
+    <div class="cookie" id="cookie">
+      <p id="cookie-note">
+        We use cookies. Not to track your soul across the internet, but because the web browser
+        freaks out if we don't put this banner here.
+      </p>
+      <span class="btns">
+        <button type="button" id="accept">[ ACCEPT COOKIES ]</button>
+        <button type="button" id="prefer">[ I PREFER CRACKERS ]</button>
+      </span>
+    </div>
+
+    <script type="module" src="/src/crumbs/main.ts"></script>
+  </body>
+</html>
