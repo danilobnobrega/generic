@@ -1,4 +1,4 @@
-import { CrumbRain, type CrumbKind } from './CrumbRain'
+import type { CrumbRain, CrumbKind } from './CrumbRain'
 
 const BANNER_CSS = `
 .cookie-bar {
@@ -22,10 +22,10 @@ let mounted = false
 
 /**
  * The persistent cookie banner. Never closes. Picking an option rains that
- * baked good over the page (its own physics layer) and, for crackers, rewrites
- * every "cookie" on the page to "cracker".
+ * baked good onto the floor in front of the doors (via the caller's CrumbRain)
+ * and, for crackers, rewrites every "cookie" on the page to "cracker".
  */
-export function mountCookieBanner(opts: { crumbScale?: number } = {}): void {
+export function mountCookieBanner(crumbs: CrumbRain): void {
   if (mounted) return
   mounted = true
 
@@ -49,10 +49,8 @@ export function mountCookieBanner(opts: { crumbScale?: number } = {}): void {
   bar.append(note, btns)
   document.body.appendChild(bar)
 
-  // build the physics layer and fetch both models now, so the first crumb
-  // drops the instant a button is clicked
-  const rain = new CrumbRain(opts.crumbScale)
-  void rain.preload()
+  // fetch both models now, so the first crumb drops the instant a button is clicked
+  void crumbs.preload()
 
   let done = false
 
@@ -61,7 +59,7 @@ export function mountCookieBanner(opts: { crumbScale?: number } = {}): void {
     done = true
     bar.remove()
     if (kind === 'cracker') swapCookieText()
-    void rain.rain(kind)
+    void crumbs.rain(kind)
   }
 
   accept.addEventListener('click', () => choose('cookie'))

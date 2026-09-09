@@ -5,8 +5,9 @@ import { normalizeModel } from '../models/normalize'
 
 export type CrumbKind = 'cookie' | 'cracker'
 
-/** world half-height of the orthographic view */
-const VIEW_H = 6
+/** half-height of the crumb sub-world; GRAVITY and the spawn heights are tuned to this */
+export const CRUMB_VIEW_H = 6
+
 const GRAVITY = -160
 const TAU = Math.PI * 2
 const SLOTS = 10
@@ -23,20 +24,18 @@ interface Item {
 }
 
 /**
- * A transparent full-screen physics layer, on Rapier. Orthographic so a crumb
- * never changes size with depth.
+ * The cookie / cracker pile, on Rapier. It has no canvas of its own — it lives
+ * as a scaled sub-world (`stage`) inside a scene the caller owns, planted just
+ * in front of the closed doors. When the camera dollies through the doorway the
+ * pile is simply left behind, out of frame; nothing tells it to disappear.
  *
- * Colliders are rounded boxes sized to each model — rounded edges can't balance
- * on a corner, flat faces stack cleanly, the solver converges and the pile
- * reaches Rapier's own sleep with no jitter. No side walls (an invisible thing
- * to rest against looks impossible). The render uses cheap lit materials, no
- * image-based lighting — kind on integrated GPUs.
+ * Rounded-box colliders (can't balance on a corner, stack flat, converge to
+ * Rapier's own sleep with no jitter), no side walls, cheap Lambert materials.
+ * The caller positions/scales `stage`, calls `layout()` on resize, and pumps
+ * `step(dt)` from its own render loop.
  */
 export class CrumbRain {
-  private canvas: HTMLCanvasElement
-  private renderer: THREE.WebGLRenderer
-  private scene = new THREE.Scene()
-  private camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 200)
+  readonly stage = new THREE.Group()
 
   private world?: RAPIER.World
   private ready: Promise<void>
@@ -45,40 +44,23 @@ export class CrumbRain {
   private loader = new GLTFLoader()
   private protos: Partial<Record<CrumbKind, Proto>> = {}
   private items: Item[] = []
-  private clock = new THREE.Clock()
   private acc = 0
   private running = false
   private halfW = 1
   private spawnIndex = 0
   private crumbScale: number
 
-  constructor(crumbScale = 1) {
-    this.crumbScale = crumbScale
+  constructor(opts: { parent: THREE.Object3D; crumbScale?: number }) {
+    this.crumbScale = opts.crumbScale ?? 1
+    opts.parent.add(this.stage)
 
-    this.canvas = document.createElement('canvas')
-    const cs = this.canvas.style
-    cs.position = 'fixed'
-    cs.inset = '0'
-    cs.width = '100%'
-    cs.height = '100%'
-    cs.zIndex = '6'
-    cs.pointerEvents = 'none'
-    document.body.appendChild(this.canvas)
-
-    this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas, antialias: true, alpha: true })
-    this.renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5))
-    this.renderer.outputColorSpace = THREE.SRGBColorSpace
-
-    this.camera.position.set(0, 0, 30)
-    this.camera.lookAt(0, 0, 0)
-
-    const dir = new THREE.DirectionalLight('#fff4e6', 2.6)
-    dir.position.set(3, 6, 8)
-    this.scene.add(dir, new THREE.HemisphereLight('#f2f0ea', '#6b6456', 1.1))
+    // one warm key at the threshold — short range so the room beyond stays dark;
+    // the room's own dim hemisphere fills the shadow side
+    const key = new THREE.PointLight('#fff1dc', 11, 6.5, 2)
+    key.position.set(0.6, 3.2, 3.6)
+    this.stage.add(key)
 
     this.ready = this.initPhysics()
-    window.addEventListener('resize', this.resize)
-    this.resize()
   }
 
   private fail(msg: string): void {
@@ -107,25 +89,12 @@ export class CrumbRain {
     this.floorC = world.createCollider(
       RAPIER.ColliderDesc.cuboid(200, 0.5, 200).setFriction(0.6).setRestitution(0),
     )
-    this.placeBounds()
+    this.floorC.setTranslation({ x: 0, y: -CRUMB_VIEW_H, z: 0 })
   }
 
-  private placeBounds(): void {
-    this.floorC?.setTranslation({ x: 0, y: -VIEW_H, z: 0 })
-  }
-
-  private resize = (): void => {
-    const w = window.innerWidth
-    const h = window.innerHeight
-    this.halfW = VIEW_H * (w / h)
-
-    this.camera.left = -this.halfW
-    this.camera.right = this.halfW
-    this.camera.top = VIEW_H
-    this.camera.bottom = -VIEW_H
-    this.camera.updateProjectionMatrix()
-    this.renderer.setSize(w, h)
-    this.placeBounds()
+  /** call on viewport resize — only the horizontal spawn spread depends on aspect */
+  layout(aspect: number): void {
+    this.halfW = CRUMB_VIEW_H * aspect
   }
 
   private async proto(kind: CrumbKind): Promise<Proto> {
@@ -163,7 +132,7 @@ export class CrumbRain {
     for (let i = 0; i < POOL; i++) {
       const clone = n.object.clone(true)
       clone.visible = false
-      this.scene.add(clone)
+      this.stage.add(clone)
       pool.push(clone)
     }
 
@@ -181,12 +150,7 @@ export class CrumbRain {
     await this.ready
     const proto = await this.proto(kind)
     if (!this.world) return
-
-    if (!this.running) {
-      this.running = true
-      this.clock.getDelta()
-      this.renderer.setAnimationLoop(this.frame)
-    }
+    this.running = true
 
     const total = Math.min(count, POOL)
     const burst = Math.min(5, total)
@@ -216,7 +180,7 @@ export class CrumbRain {
 
     const body = world.createRigidBody(
       RAPIER.RigidBodyDesc.dynamic()
-        .setTranslation(x, VIEW_H + 1.6 + Math.random() * 1.4, (Math.random() * 2 - 1) * 0.3)
+        .setTranslation(x, CRUMB_VIEW_H + 1.6 + Math.random() * 1.4, (Math.random() * 2 - 1) * 0.3)
         .setRotation({ x: q.x, y: q.y, z: q.z, w: q.w })
         .setLinvel((Math.random() - 0.5) * 0.6, -2 - Math.random() * 2, 0)
         .setAngvel({ x: (Math.random() - 0.5) * 2, y: (Math.random() - 0.5) * 2, z: (Math.random() - 0.5) * 2 })
@@ -229,12 +193,12 @@ export class CrumbRain {
     this.items.push({ mesh, body })
   }
 
-  private frame = (): void => {
+  /** advance the physics; positions are in `stage`-local units */
+  step(dt: number): void {
     const world = this.world
-    if (!world) return
+    if (!world || !this.running) return
 
-    const d = Math.min(this.clock.getDelta(), 0.1)
-    this.acc = Math.min(this.acc + d, world.timestep * 3)
+    this.acc = Math.min(this.acc + dt, world.timestep * 3)
     let steps = 0
     while (this.acc >= world.timestep && steps < 3) {
       world.step()
@@ -248,7 +212,5 @@ export class CrumbRain {
       it.mesh.position.set(t.x, t.y, t.z)
       it.mesh.quaternion.set(r.x, r.y, r.z, r.w)
     }
-
-    this.renderer.render(this.scene, this.camera)
   }
 }
