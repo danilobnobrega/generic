@@ -21,8 +21,8 @@ const LETTER_DEPTH = 0.17
 
 /**
  * The hero. The off-white ground is a shader (grain + vignette); on it stands a
- * physical sign — "We are GENERIC" as extruded Times Bold letters with real
- * depth and a bevel, dark polished metal. The cursor lays a heat field
+ * physical sign — "We are GENERIC" as extruded Tinos (Times-metric) letters
+ * with real depth and a bevel, dark polished metal. The cursor lays a heat field
  * (ping-pong FBO) and where it's hot the metal turns to liquid chrome, cooling
  * back when you leave.
  *
