@@ -11,4 +11,4 @@ const spinMode = import.meta.env.VITE_HERO_MODE === 'spin' ? 'free' : 'cap'
 console.info('[hero] spinMode:', spinMode)
 
 const hero = new ShaderHero(canvas, { crumbScale: 2, spinMode })
-mountCookieBanner(hero.crumbs)
+mountCookieBanner(hero.crumbs, () => hero.unlock())

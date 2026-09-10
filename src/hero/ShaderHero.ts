@@ -21,6 +21,25 @@ const DOOR_CAM_Z = 4
 const CRUMB_Z = 2.4
 /** extrusion depth of the sign letters, as a fraction of cap height */
 const LETTER_DEPTH = 0.17
+/** 'free' mode: how far the door-cubes rotate before freezing (radians). 2.129 = 122° */
+const SPIN_CAP = 2.129
+/** 'free' mode: scroll fraction at which the rotation + recede freeze and the camera
+ *  starts its forward dive */
+const FREEZE_P = 0.61
+/** 'free' mode: where the camera ends its dive — punched fully past the frozen cubes */
+const CAM_DIVE_END = -17
+/** section 2 — the photo tunnel behind the doors (Floema's recipe) */
+const TUNNEL_ARM_P = 0.99 // turns on once the camera has punched fully past the cubes
+const TUNNEL_RADIUS = 10 // photos ride a circle of this radius around the forward axis
+const TUNNEL_SPACING = 2 // z-gap between photos
+const TUNNEL_FOG_FAR = 78 // photos dissolve into the dark by this distance
+const TUNNEL_PLANES = 44 // enough to fill the corridor + a buffer
+const TUNNEL_IMG_SIZE = 1.5
+const TUNNEL_SCALE_RAND = 0.5
+const TUNNEL_SPEED_WARP = 240 // units/sec burst the instant the tunnel arms
+const TUNNEL_SPEED_IDLE = 10 // baseline drift once the burst settles
+const TUNNEL_WARP_TIME = 1.1 // seconds to ease from warp -> idle
+const TUNNEL_SCROLL_BOOST = 42 // extra units/sec at full scroll input
 
 /**
  * The hero. The off-white ground is a shader (grain + vignette); on it stands a
@@ -57,10 +76,14 @@ export class ShaderHero {
   private rightHinge = new THREE.Group()
   private leftPanel?: THREE.Mesh
   private rightPanel?: THREE.Mesh
-  // the cube's non-front faces — concrete grey so the tumble reads as a solid box
-  private blockMat = new THREE.MeshStandardMaterial({ color: 0x6b665b, roughness: 0.85 })
-  // 'free' mode tagline text — dark sign material, own instance so it can be tuned
-  private tagMat = new THREE.MeshStandardMaterial({ color: 0x121214, roughness: 0.62, metalness: 0 })
+  // The tagline TEXT material. Self-contained shader (ignores the scene light list so
+  // the other cube's key can't cross-light it): one key direction, gated by the flat
+  // face's orientation — dark until the cube turns that face into its key (~123°),
+  // then it lights up. Left/right keys mirror.
+  private KEY_L = new THREE.Vector3(8.4, 2.0, -5.45)
+  private KEY_R = new THREE.Vector3(-8.4, 2.0, -5.45)
+  private tagMatL = this.makeSideMat(this.KEY_L, 0x242424, 1.05)
+  private tagMatR = this.makeSideMat(this.KEY_R, 0x242424, 1.05)
   private cubeSide = 1 // real edge length of each door-cube, set in buildDoors
   private _look = new THREE.Vector3()
 
@@ -89,6 +112,12 @@ export class ShaderHero {
   private progress = 0
   private progressTarget = 0
   private manual = 0
+
+  // section 2 — the photo tunnel
+  private gallery = new THREE.Group()
+  private galleryPhotos: THREE.Mesh[] = []
+  private tunnelTime = -1 // seconds since the tunnel armed (-1 = not armed)
+  private tunnelScroll = 0 // 0..1 scroll input, coasts back to 0 -> speed boost on top of idle
 
   constructor(canvas: HTMLCanvasElement, opts: { crumbScale?: number; spinMode?: 'cap' | 'free' } = {}) {
     this.spinMode = opts.spinMode ?? 'cap'
@@ -139,24 +168,48 @@ export class ShaderHero {
 
     this.doorMat = new THREE.RawShaderMaterial({
       side: THREE.DoubleSide, // the leaves must stay visible through the whole swing
-      uniforms: { map: { value: this.heroRT.texture } },
+      uniforms: {
+        map: { value: this.heroRT.texture },
+        uPlay: { value: this.spinMode === 'free' ? 1 : 0 }, // light/shadow play only in 'free'
+        // 0 -> 1, set in frame(): GENERIC faces fall into shadow on uPhase (fast),
+        // the tagline outer faces come up on uPhaseB (slower)
+        uPhase: { value: 0 },
+        uPhaseB: { value: 0 },
+      },
       vertexShader: `
         precision highp float;
         uniform mat4 projectionMatrix;
         uniform mat4 modelViewMatrix;
         attribute vec3 position;
         attribute vec2 uv;
+        attribute float aFaceKind; // 0 = GENERIC front, 1 = tagline outer, 2 = other
         varying vec2 vUv;
+        varying float vKind;
         void main() {
           vUv = uv;
+          vKind = aFaceKind;
           gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
         }`,
       fragmentShader: `
         precision highp float;
         uniform sampler2D map;
+        uniform float uPlay;
+        uniform float uPhase;
+        uniform float uPhaseB;
         varying vec2 vUv;
+        varying float vKind;
         void main() {
-          gl_FragColor = texture2D(map, vUv);
+          vec3 tex = texture2D(map, vUv).rgb;
+          if (uPlay < 0.5) { gl_FragColor = vec4(tex, 1.0); return; }
+          float bright = 1.0;
+          if (vKind < 0.5) {
+            bright = mix(1.0, 0.03, uPhase);   // GENERIC front: full -> deep shadow (fast)
+          } else if (vKind < 1.5) {
+            bright = mix(0.02, 1.0, uPhaseB);  // tagline outer: invisible -> full (slow)
+          } else {
+            bright = mix(1.0, 0.24, uPhase);   // the rest: rides down with GENERIC
+          }
+          gl_FragColor = vec4(tex * bright, 1.0);
         }`,
     })
 
@@ -182,7 +235,21 @@ export class ShaderHero {
       depthWrite: false,
       uniforms: {
         uResolution: { value: new THREE.Vector2(bw, bh) },
+        uTex: { value: null },
+        uHasTex: { value: 0 },
+        uTexMix: { value: 0 }, // 0 = off-white paper, 1 = concrete; ramped by scroll in frame()
+        uViewAspect: { value: bw / bh },
+        uTexAspect: { value: 1 },
       },
+    })
+    // test: a concrete slab instead of the flat off-white ground
+    new THREE.TextureLoader().load(`${import.meta.env.BASE_URL}textures/hero-concrete.png`, (tex) => {
+      tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping
+      tex.minFilter = THREE.LinearMipmapLinearFilter
+      tex.anisotropy = this.renderer.capabilities.getMaxAnisotropy()
+      this.heroMat.uniforms.uTex.value = tex
+      this.heroMat.uniforms.uTexAspect.value = tex.image.width / tex.image.height
+      this.heroMat.uniforms.uHasTex.value = 1
     })
 
     this.buildLetterMaterial()
@@ -197,6 +264,7 @@ export class ShaderHero {
     this.doorScene.add(this.leftHinge, this.rightHinge)
     this.buildSpaceBehind()
     this.buildDoors()
+    if (this.spinMode === 'free') this.buildGallery()
 
     // the crumb pile — a scaled sub-world planted at CRUMB_Z, in front of the
     // closed doors. Scale maps the crumb ortho view (2·CRUMB_VIEW_H tall) exactly
@@ -245,21 +313,41 @@ export class ShaderHero {
       p.parent?.remove(p)
     }
 
-    // paper (heroRT) with baked UVs on the front face; concrete on the other five
-    const bakeFront = (g: THREE.BufferGeometry, faceX: number): void => {
+    // every face samples the hero ground (heroRT) with clean cube-local 0..1 UVs so
+    // nothing ever samples out of bounds (that clamp-stretch at the frame edge was the
+    // bowed band). Front face x is mirrored per cube so the concrete stays continuous
+    // across the closed seam. Also tag each vertex by face kind for the light play.
+    const bakeUVs = (g: THREE.BufferGeometry, dir: -1 | 1): void => {
       const pos = g.attributes.position
+      const nor = g.attributes.normal
       const uv = g.attributes.uv
+      const kind = new Float32Array(pos.count)
       for (let i = 0; i < pos.count; i++) {
-        if (pos.getZ(i) < -1e-4) continue // front face only (translated to z = 0)
-        const worldX = faceX + pos.getX(i)
-        const worldY = pos.getY(i)
-        uv.setXY(i, (worldX + vw / 2) / vw, (worldY + vh / 2) / vh)
+        const px = pos.getX(i)
+        const py = pos.getY(i)
+        const pz = pos.getZ(i)
+        const nx = nor.getX(i)
+        if (pz > -1e-4 && Math.abs(nor.getZ(i)) > 0.5) {
+          const u = px / S + 0.5
+          uv.setXY(i, dir === -1 ? u : 1.0 - u, py / S + 0.5) // front — mirror x on the right cube
+          kind[i] = 0 // GENERIC front
+        } else if (Math.abs(nx) > 0.5) {
+          uv.setXY(i, pz / S + 1.0, py / S + 0.5) // ±x face
+          kind[i] = Math.sign(nx) === dir ? 1 : 2 // outer x-face (toward the frame edge) = tagline
+        } else if (Math.abs(nor.getY(i)) > 0.5) {
+          uv.setXY(i, px / S + 0.5, pz / S + 1.0) // ±y face
+          kind[i] = 2
+        } else {
+          uv.setXY(i, px / S + 0.5, py / S + 0.5) // back (-z) face
+          kind[i] = 2
+        }
       }
       uv.needsUpdate = true
+      g.setAttribute('aFaceKind', new THREE.BufferAttribute(kind, 1))
     }
-    // BoxGeometry group order: +x, -x, +y, -y, +z(front), -z. At the 147° cap the
-    // OUTER face shows: -x on the left cube, +x on the right — that's where the tagline goes.
-    const mats = [this.blockMat, this.blockMat, this.blockMat, this.blockMat, this.doorMat, this.blockMat]
+    // all six slots: the same door material (heroRT / concrete), like the GENERIC face
+    const D = this.doorMat
+    const mats: THREE.Material[] = [D, D, D, D, D, D]
 
     // dir -1 = left cube (its inner/right edge at the seam x=0), +1 = right cube
     const buildLeaf = (hinge: THREE.Group, dir: -1 | 1): THREE.Mesh => {
@@ -268,9 +356,12 @@ export class ShaderHero {
       const cx = -dir * (S / 2 - over) // cube centre so the seam edge lands on x = 0
       const g = new THREE.BoxGeometry(S, S, S)
       g.translate(0, 0, -S / 2) // front face -> local z = 0
-      bakeFront(g, (dir * vw) / 2 + cx)
+      bakeUVs(g, dir)
       const mesh = new THREE.Mesh(g, mats)
       mesh.position.x = cx
+      // the two cubes overlap by ~`over` at the seam; sit the right one a hair back
+      // in z so that coplanar strip can't z-fight as the doors split
+      mesh.position.z = dir === 1 ? -0.008 : 0
       hinge.add(mesh)
       return mesh
     }
@@ -279,11 +370,8 @@ export class ShaderHero {
     this.rightPanel = buildLeaf(this.rightHinge, 1)
 
     if (this.spinMode === 'free') {
-      // isolate each cube on its own light layer (see buildSpaceBehind)
       this.leftPanel.layers.set(1)
       this.rightPanel.layers.set(2)
-      // the slab casts the shadow that hides the tagline letters; it also receives
-      // (self-shading as it turns)
       for (const p of [this.leftPanel, this.rightPanel]) {
         p.castShadow = true
         p.receiveShadow = true
@@ -291,24 +379,11 @@ export class ShaderHero {
     }
   }
 
-  /** placeholder space beyond the doors — replace with section 2 */
+  /** the space beyond the doors — the tunnel's fog IS the backdrop now */
   private buildSpaceBehind(): void {
-    const floor = new THREE.Mesh(
-      new THREE.PlaneGeometry(60, 60),
-      new THREE.MeshStandardMaterial({ color: 0x2a2723, roughness: 0.95 }),
-    )
-    floor.rotation.x = -Math.PI / 2
-    floor.position.set(0, -2.2, -16)
-
-    const wall = new THREE.Mesh(
-      new THREE.PlaneGeometry(60, 34),
-      new THREE.MeshStandardMaterial({ color: 0x1f1d1a, roughness: 1 }),
-    )
-    wall.position.set(0, 7, -28)
-
     const glow = new THREE.PointLight(0xffe6c4, 20, 30)
     glow.position.set(0, 1.5, -9)
-    this.doorScene.add(floor, wall, glow)
+    this.doorScene.add(glow)
 
     if (this.spinMode !== 'free') {
       const key = new THREE.DirectionalLight(0xfff4e6, 2.4) // soft key from the camera side
@@ -357,7 +432,117 @@ export class ShaderHero {
     this.doorCam.layers.enable(2)
   }
 
+  /**
+   * Section 2 — a photo tunnel, Floema's recipe. Planes ride a circle of radius
+   * TUNNEL_RADIUS around the forward axis, spread by the golden angle, spaced
+   * TUNNEL_SPACING apart in z, all bunched behind the fog to start (invisible). Once
+   * the camera is past the cubes the tunnel arms: a warp burst that eases to an idle
+   * drift, plus a scroll boost. THREE.Fog (= the dark behind) does all the fade; a
+   * plane that passes the camera recycles to the far end. Placeholders: grey cards.
+   */
+  private buildGallery(): void {
+    let seed = 0x9e37
+    const rng = (): number => {
+      seed = (seed * 1664525 + 1013904223) >>> 0
+      return seed / 0xffffffff
+    }
+    const golden = Math.PI * (3 - Math.sqrt(5))
+    const geo = new THREE.PlaneGeometry(1, 1)
+    const NDISTINCT = 12
+    const texes: THREE.CanvasTexture[] = []
+    for (let k = 0; k < NDISTINCT; k++) {
+      const portrait = rng() > 0.5
+      const cw = portrait ? 150 : 220
+      const ch = portrait ? 220 : 150
+      const cnv = document.createElement('canvas')
+      cnv.width = cw
+      cnv.height = ch
+      const ctx = cnv.getContext('2d')!
+      const g = 34 + Math.round(rng() * 78)
+      ctx.fillStyle = `rgb(${g},${g},${g + 4})`
+      ctx.fillRect(0, 0, cw, ch)
+      ctx.strokeStyle = 'rgba(255,255,255,0.22)'
+      ctx.lineWidth = 4
+      ctx.strokeRect(2, 2, cw - 4, ch - 4)
+      ctx.fillStyle = 'rgba(255,255,255,0.4)'
+      ctx.font = `bold ${Math.round(ch * 0.4)}px ui-monospace, monospace`
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      ctx.fillText(String(k + 1), cw / 2, ch / 2)
+      const tex = new THREE.CanvasTexture(cnv)
+      tex.colorSpace = THREE.SRGBColorSpace
+      tex.generateMipmaps = false
+      tex.minFilter = THREE.LinearFilter
+      texes.push(tex)
+    }
+    for (let i = 0; i < TUNNEL_PLANES; i++) {
+      const tex = texes[i % NDISTINCT]
+      const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false }))
+      const a = i * golden
+      m.position.x = Math.cos(a) * TUNNEL_RADIUS
+      m.position.y = Math.sin(a) * TUNNEL_RADIUS
+      m.position.z = CAM_DIVE_END - TUNNEL_FOG_FAR - i * TUNNEL_SPACING // bunched behind the fog
+      const aspect = tex.image.width / tex.image.height
+      const base = TUNNEL_IMG_SIZE + rng() * TUNNEL_SCALE_RAND
+      if (aspect >= 1) m.scale.set(base * aspect, base, 1)
+      else m.scale.set(base, base / aspect, 1)
+      this.galleryPhotos.push(m)
+      this.gallery.add(m)
+    }
+    this.doorScene.add(this.gallery)
+    this.doorScene.fog = new THREE.Fog(0x000000, 0.1, TUNNEL_FOG_FAR)
+  }
+
   // ---- the sign -----------------------------------------------------
+  /**
+   * The outer-face / tagline material. Ignores the scene light list entirely (so the
+   * other cube's key can't cross-light it). One key direction, `uKeyDir`. A gate from
+   * the flat face's world normal `uFaceN` (fed per frame): 0 while the face is turned
+   * away from its key, ramping over ~123°→140°. The shading itself uses the real
+   * geometry normal, so the flat face reads as flat diffuse and the raised letters
+   * pick up relief — but both stay pure black until the gate opens.
+   */
+  private makeSideMat(keyPos: THREE.Vector3, albedo: number, keyInt: number): THREE.ShaderMaterial {
+    return new THREE.ShaderMaterial({
+      uniforms: {
+        uKeyDir: { value: keyPos.clone().normalize() },
+        uFaceN: { value: new THREE.Vector3(0, 0, 1) },
+        uReveal: { value: 0 }, // scroll-paced brightening, driven from frame()
+        uAlbedo: { value: new THREE.Color(albedo) },
+        uKeyColor: { value: new THREE.Color(0xffe8cc) },
+        uKeyInt: { value: keyInt }, // final reveal brightness (light amount, not colour)
+      },
+      vertexShader: `
+        varying vec3 vRealN;
+        void main() {
+          vRealN = normalize(mat3(modelMatrix) * normal);
+          gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(position, 1.0);
+        }`,
+      fragmentShader: `
+        precision highp float;
+        uniform vec3 uKeyDir;
+        uniform vec3 uFaceN;
+        uniform float uReveal;
+        uniform vec3 uAlbedo;
+        uniform vec3 uKeyColor;
+        uniform float uKeyInt;
+        varying vec3 vRealN;
+        void main() {
+          // how far the flat face is still turned AWAY from its key. dot goes
+          // ~-0.5 (spin 100°) -> 0 (123°) -> +0.05 (126°). Gate opens over ~105-120°
+          // so it doesn't depend on the face turning far past the crossover.
+          float d = dot(normalize(uFaceN), uKeyDir);
+          float gate = smoothstep(-0.32, -0.04, d);
+          // relief detail from the real normal (subtle) — gives the raised letters form
+          float relief = mix(0.72, 1.0, clamp(dot(normalize(vRealN), uKeyDir) * 2.0 + 0.55, 0.0, 1.0));
+          // a dark-concrete floor (not #000) once the surface is in play
+          float amb = 0.015 * gate;
+          vec3 col = uAlbedo * (amb + uKeyColor * uReveal * gate * relief * uKeyInt);
+          gl_FragColor = vec4(col, 1.0);
+        }`,
+    })
+  }
+
   /**
    * Dark polished metal: a vertical studio gradient off the view normal, a hard
    * fresnel sliver on the edges, and a sharp bevel highlight. Where the cursor's
@@ -371,6 +556,7 @@ export class ShaderHero {
         uField: { value: this.rtA.texture },
         uOpen: { value: 0 },
         uLight: { value: new THREE.Vector3(0.35, 0.55, 0.75).normalize() },
+        uPhase: { value: 0 }, // "We are GENERIC" falls into shadow with its face
       },
       vertexShader: `
         varying vec3 vViewN;
@@ -385,6 +571,7 @@ export class ShaderHero {
         uniform sampler2D uField;
         uniform float uOpen;
         uniform vec3 uLight;
+        uniform float uPhase;
         varying vec3 vViewN;
         varying vec4 vClip;
 
@@ -411,7 +598,8 @@ export class ShaderHero {
           chrome += fres * 0.45 + spec;
 
           float k = smoothstep(0.06, 0.5, heat) * (1.0 - uOpen);
-          gl_FragColor = vec4(mix(rest, chrome, k), 1.0);
+          vec3 col = mix(rest, chrome, k) * mix(1.0, 0.05, uPhase); // darken into shadow
+          gl_FragColor = vec4(col, 1.0);
         }`,
     })
 
@@ -526,11 +714,15 @@ export class ShaderHero {
       }
       cy /= loop.length
       cz /= loop.length
+      // recess each cap's centroid a hair into its own half so the cap becomes a
+      // shallow cone instead of a flat plane at x=0. The perimeter still meets the
+      // cut edge exactly (no gap in the glyph), but the two caps no longer share a
+      // coincident plane — which was the faint shimmer as the halves split.
       for (let i = 0; i < loop.length; i++) {
         const [y1, z1] = loop[i]
         const [y2, z2] = loop[(i + 1) % loop.length]
-        L.push(0, cy, cz, 0, y2, z2, 0, y1, z1)
-        R.push(0, cy, cz, 0, y1, z1, 0, y2, z2)
+        L.push(-0.012, cy, cz, 0, y2, z2, 0, y1, z1)
+        R.push(0.012, cy, cz, 0, y1, z1, 0, y2, z2)
         for (let j = 0; j < 3; j++) {
           Ln.push(-1, 0, 0)
           Rn.push(1, 0, 0)
@@ -648,24 +840,22 @@ export class ShaderHero {
       g.computeBoundingBox()
       const gb = g.boundingBox!
       g.translate(-(gb.max.x + gb.min.x) / 2, -(gb.max.y + gb.min.y) / 2, 0)
-      return new THREE.Mesh(g, this.spinMode === 'free' ? this.tagMat : this.letterMat)
+      return new THREE.Mesh(g, this.letterMat)
     }
 
     const tagL = makeTag('We do things')
     const tagR = makeTag('for people.')
     if (this.spinMode === 'free') {
       // left cube: on its -x (outer) face, facing -x, just outside it.
+      tagL.material = this.tagMatL // self-contained, same key/gate as the face, darker albedo
       tagL.rotation.y = -Math.PI / 2
       tagL.position.set(cxL - cs / 2 - 0.05, yOff, -cs / 2)
-      tagL.layers.set(1) // same light layer as leftPanel
-      tagL.castShadow = true // relief self-shadows once lit
-      tagL.receiveShadow = true // sits in the slab's shadow until then
+      tagL.layers.set(1)
       // right cube: mirror — on its +x (outer) face
+      tagR.material = this.tagMatR
       tagR.rotation.y = Math.PI / 2
       tagR.position.set(-(cxL - cs / 2 - 0.05), yOff, -cs / 2)
       tagR.layers.set(2)
-      tagR.castShadow = true
-      tagR.receiveShadow = true
     } else {
       tagL.rotation.y = Math.PI / 2 // inner (seam) face
       tagL.position.set(vw / 2 - 0.02, yOff, -cs / 2)
@@ -713,7 +903,9 @@ export class ShaderHero {
     this.rtA = this.rtB
     this.rtB = swap
 
-    // ground (paper) -> heroRT, mapped onto the door leaves
+    // ground -> heroRT, mapped onto the door leaves. Off-white at rest, morphs to
+    // concrete over the first stretch of scroll.
+    this.heroMat.uniforms.uTexMix.value = THREE.MathUtils.smoothstep(this.progress, 0.02, 0.28)
     this.renderer.setRenderTarget(this.heroRT)
     this.renderer.render(this.heroScene, this.camera)
     this.renderer.setRenderTarget(null)
@@ -730,28 +922,47 @@ export class ShaderHero {
     const vh = 2 * DOOR_CAM_Z * Math.tan(THREE.MathUtils.degToRad(this.doorCam.fov / 2))
     const vw = vh * (this.W / this.H)
 
-    // free mode: the whole transition freezes once the cubes hit the 147° frame
-    // (~85% scroll) — no more rotation AND no more recede past that point
-    const mp = this.spinMode === 'free' ? Math.min(P, 0.85) : P
+    const fly = THREE.MathUtils.clamp((P - 0.3) / 0.7, 0, 1)
+    const f = fly * fly // gentle ease-in — no lurch when they launch (cap mode)
 
-    const fly = THREE.MathUtils.clamp((mp - 0.3) / 0.7, 0, 1)
-    const f = fly * fly // gentle ease-in — no lurch when they launch
-    const fwd = -f * 13 // recede into -z; the camera follows more slowly so distance grows
-    const xPull = 1 - f * 0.3 // slight drift toward centre
+    // free mode: one shared curve drives the rotation AND the recede, so the cubes
+    // turn and pull back together from the first frame (not spin-then-slide). Reaches
+    // 1 at FREEZE_P (the SPIN_CAP / frozen frame), smootherstep so it eases to a stop.
+    const du = THREE.MathUtils.clamp(P / FREEZE_P, 0, 1)
+    const doorE = du * du * du * (du * (du * 6 - 15) + 10)
+
+    const fwd = this.spinMode === 'free' ? -doorE * 9 : -f * 13
+    // 'free' mode: NO inward drift — it made the two halves of the split wordmark
+    // (and the two cube faces) converge and overlap at the seam as the scroll began.
+    // Perspective shrink alone keeps the receding cubes framed.
+    const xPull = this.spinMode === 'free' ? 1 : 1 - f * 0.3
 
     this.letterMat.uniforms.uField.value = this.rtA.texture
     this.letterMat.uniforms.uOpen.value = Math.min(1, P * 2.5)
 
     if (this.spinMode === 'free') {
-      // doors open inward and DECELERATE into the 147° cap (reached at ~85% scroll)
-      // instead of slamming into it — so the tagline face, which only clears its own
-      // shadow in the last stretch of that rotation, brightens slowly as it eases to
-      // a stop rather than popping.
-      const u = THREE.MathUtils.clamp(P / 0.85, 0, 1)
-      const ease = u * u * u * (u * (u * 6 - 15) + 10) // smootherstep, flat at both ends
-      const spin = 2.566 * ease
+      // rotation rides the same curve as the recede (doorE) and decelerates into
+      // SPIN_CAP at FREEZE_P instead of slamming into it
+      const spin = SPIN_CAP * doorE
       this.leftHinge.rotation.y = spin
       this.rightHinge.rotation.y = -spin
+      // feed each tagline text material the world normal of the flat face it gates
+      // on (left: -x rotated; right: +x rotated the other way)
+      const cs = Math.cos(spin)
+      const sn = Math.sin(spin)
+      this.tagMatL.uniforms.uFaceN.value.set(-cs, 0, sn)
+      this.tagMatR.uniforms.uFaceN.value.set(cs, 0, sn)
+      // light/shadow play, tied to the rotation: GENERIC drops into full shadow FAST
+      // and is completely dark well before the tagline (+ its text) comes up slowly,
+      // so the two are never legible at once
+      const deg = (spin * 180) / Math.PI
+      const dark = THREE.MathUtils.smoothstep(deg, 52, 70)
+      const bright = THREE.MathUtils.smoothstep(deg, 80, 122)
+      this.doorMat.uniforms.uPhase.value = dark
+      this.doorMat.uniforms.uPhaseB.value = bright
+      this.letterMat.uniforms.uPhase.value = dark
+      this.tagMatL.uniforms.uReveal.value = bright
+      this.tagMatR.uniforms.uReveal.value = bright
     } else {
       // rotate exactly 90° — front face swings away, the inner (tagline) face
       // comes fully round to the camera — then stop turning
@@ -763,17 +974,59 @@ export class ShaderHero {
     this.leftHinge.position.set((-vw / 2) * xPull, 0, fwd)
     this.rightHinge.position.set((vw / 2) * xPull, 0, fwd)
 
-    // camera holds while the doors open, then eases in on the same curve — slower
-    // than the cubes recede, so they shrink with distance smoothly
-    this.doorCam.position.z = THREE.MathUtils.lerp(DOOR_CAM_Z, -1, f)
-    this._look.set(0, THREE.MathUtils.lerp(0, -0.15, f), THREE.MathUtils.lerp(0, -12, f))
-    this.doorCam.lookAt(this._look)
+    if (this.spinMode === 'free') {
+      // once the cubes lock (FREEZE_P) the camera eases forward toward them — the
+      // approved shot that lets you take in the revealed tagline up close (settles
+      // ~z -4 by 90% scroll) — then in the last stretch it PUNCHES through the gap
+      // into the tunnel.
+      const d1 = THREE.MathUtils.clamp((P - FREEZE_P) / (0.9 - FREEZE_P), 0, 1)
+      const d2 = THREE.MathUtils.clamp((P - 0.9) / 0.1, 0, 1)
+      const camZ = THREE.MathUtils.lerp(DOOR_CAM_Z, -4, d1 * (2 - d1)) + Math.pow(d2, 2.2) * (CAM_DIVE_END + 4)
+      this.doorCam.position.z = camZ
+      this._look.set(0, 0, camZ - 10) // always straight ahead
+      this.doorCam.lookAt(this._look)
+
+      this.stepGallery(dt, P, camZ)
+    } else {
+      // cap mode: camera holds while the doors open, then eases in on the same curve
+      this.doorCam.position.z = THREE.MathUtils.lerp(DOOR_CAM_Z, -1, f)
+      this._look.set(0, THREE.MathUtils.lerp(0, -0.15, f), THREE.MathUtils.lerp(0, -12, f))
+      this.doorCam.lookAt(this._look)
+    }
 
     this.crumbs.step(dt)
 
     this.renderer.render(this.doorScene, this.doorCam)
 
     this.prevPointer.copy(this.pointer)
+  }
+
+  /** advance the photo tunnel — Floema's model: warp burst -> idle drift, + a scroll
+   *  boost, recycle past the camera, THREE.Fog does the fade */
+  private stepGallery(dt: number, P: number, camZ: number): void {
+    if (P < TUNNEL_ARM_P) {
+      this.tunnelTime = -1 // parked behind the fog, invisible
+      this.tunnelScroll = 0
+      return
+    }
+    if (this.tunnelTime < 0) this.tunnelTime = 0
+    this.tunnelTime += dt
+    this.tunnelScroll = Math.max(0, this.tunnelScroll - dt * 0.55) // coasts back to idle
+
+    const expo = (x: number): number => (x >= 1 ? 1 : 1 - 2 ** (-6 * x))
+    const warp = expo(THREE.MathUtils.clamp(this.tunnelTime / TUNNEL_WARP_TIME, 0, 1))
+    const speed =
+      THREE.MathUtils.lerp(TUNNEL_SPEED_WARP, TUNNEL_SPEED_IDLE, warp) + expo(this.tunnelScroll) * TUNNEL_SCROLL_BOOST
+
+    let backZ = Infinity
+    for (const m of this.galleryPhotos) if (m.position.z < backZ) backZ = m.position.z
+    for (const m of this.galleryPhotos) {
+      m.position.z += speed * dt
+      if (m.position.z > camZ) {
+        m.position.z = backZ - TUNNEL_SPACING // recycle to just behind the furthest one
+        backZ = m.position.z
+      }
+    }
   }
 
   private hasFocus(): boolean {
@@ -799,20 +1052,40 @@ export class ShaderHero {
     this.pointerInside = false
   }
 
+  /** scroll is inert until the cookie banner is answered */
+  private locked = true
+
+  /** called by the cookie banner once the visitor picks cookies or crackers */
+  unlock(): void {
+    this.locked = false
+  }
+
   private onWheel = (e: WheelEvent): void => {
+    if (this.locked) return
+    if (this.spinMode === 'free' && this.manual >= 1) {
+      // hero scroll is spent — the wheel now boosts the tunnel speed (never reverses)
+      this.tunnelScroll = THREE.MathUtils.clamp(this.tunnelScroll + e.deltaY * 0.0011, 0, 1)
+      return
+    }
     this.manual = THREE.MathUtils.clamp(this.manual + e.deltaY / 2600, 0, 1)
     this.progressTarget = this.manual
   }
 
   private onScroll = (): void => {
+    if (this.locked) return
     const max = Math.max(1, document.documentElement.scrollHeight - window.innerHeight)
     this.progressTarget = THREE.MathUtils.clamp(Math.max(window.scrollY / max, this.manual), 0, 1)
   }
 
   private onKey = (e: KeyboardEvent): void => {
+    if (this.locked) return
     const step: Record<string, number> = { ArrowDown: 0.07, PageDown: 0.22, ' ': 0.22, ArrowUp: -0.07, PageUp: -0.22 }
     const s = step[e.key]
     if (s === undefined) return
+    if (this.spinMode === 'free' && this.manual >= 1) {
+      this.tunnelScroll = THREE.MathUtils.clamp(this.tunnelScroll + s * 1.6, 0, 1)
+      return
+    }
     this.manual = THREE.MathUtils.clamp(this.manual + s, 0, 1)
     this.progressTarget = this.manual
   }
@@ -834,6 +1107,7 @@ export class ShaderHero {
     this.heroRT.setSize(bw, bh)
     this.clearTargets()
     this.heroMat.uniforms.uResolution.value.set(bw, bh)
+    this.heroMat.uniforms.uViewAspect.value = bw / bh
     this.doorCam.aspect = this.W / this.H
     this.doorCam.updateProjectionMatrix()
     this.buildDoors()

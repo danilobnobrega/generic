@@ -25,7 +25,7 @@ let mounted = false
  * baked good onto the floor in front of the doors (via the caller's CrumbRain)
  * and, for crackers, rewrites every "cookie" on the page to "cracker".
  */
-export function mountCookieBanner(crumbs: CrumbRain): void {
+export function mountCookieBanner(crumbs: CrumbRain, onChoice?: () => void): void {
   if (mounted) return
   mounted = true
 
@@ -60,6 +60,7 @@ export function mountCookieBanner(crumbs: CrumbRain): void {
     bar.remove()
     if (kind === 'cracker') swapCookieText()
     void crumbs.rain(kind)
+    onChoice?.() // release the scroll lock
   }
 
   accept.addEventListener('click', () => choose('cookie'))
