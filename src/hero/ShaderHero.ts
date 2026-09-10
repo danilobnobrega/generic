@@ -10,6 +10,11 @@ import { CrumbRain, CRUMB_VIEW_H } from '../ui/CrumbRain'
 const LOCKUP_FRACTION_DESKTOP = 0.82
 const LOCKUP_FRACTION_MOBILE = 0.92
 
+/** CSS px the canvas extends above the viewport (must match `#stage { top }` in hero.css).
+ *  Chrome offsets the WebGL surface a few px down from the element box on this
+ *  machine; the dirty edge lands in this clipped-away overscan instead of on screen. */
+const OVERSCAN = 100
+
 /** distance from the door camera to the closed doors (z = 0) */
 const DOOR_CAM_Z = 4
 /** how far each leaf swings open, radians */
@@ -64,6 +69,7 @@ export class ShaderHero {
   /** the cookie/cracker pile — lives in doorScene, in front of the doors */
   readonly crumbs: CrumbRain
 
+  private canvas: HTMLCanvasElement
   private W = window.innerWidth
   private H = window.innerHeight
   private dpr = Math.min(window.devicePixelRatio, 2)
@@ -80,9 +86,22 @@ export class ShaderHero {
   private manual = 0
 
   constructor(canvas: HTMLCanvasElement, opts: { crumbScale?: number } = {}) {
+    this.canvas = canvas
+    // Size to the canvas's own laid-out box — and pass the RAW fractional size to
+    // setSize. Rounding it here makes the backing store a pixel short of the box,
+    // which forces Chrome to scale the canvas, and the Intel compositor at
+    // fractional Windows scaling then leaves a dirty strip at the top.
+    const box = canvas.getBoundingClientRect() // width x (visibleHeight + OVERSCAN)
+    this.W = Math.max(1, box.width)
+    this.H = Math.max(1, box.height - OVERSCAN) // the visible design frame
+
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' })
     this.renderer.setPixelRatio(this.dpr)
-    this.renderer.setSize(this.W, this.H)
+    this.renderer.setSize(box.width, box.height, false) // backing store covers the whole oversized canvas
+    this.renderer.setViewport(0, 0, this.W, this.H) // ...but render only the visible bottom part
+
+    const bw = Math.round(this.W * this.dpr)
+    const bh = Math.round(this.H * this.dpr) // device-px size of the visible frame
 
     const rtOpts: THREE.RenderTargetOptions = {
       type: THREE.HalfFloatType,
@@ -92,10 +111,9 @@ export class ShaderHero {
       depthBuffer: false,
       stencilBuffer: false,
     }
-    const [fw, fh] = this.fieldSize()
-    this.rtA = new THREE.WebGLRenderTarget(fw, fh, rtOpts)
-    this.rtB = new THREE.WebGLRenderTarget(fw, fh, rtOpts)
-    this.heroRT = new THREE.WebGLRenderTarget(this.W * this.dpr, this.H * this.dpr, {
+    this.rtA = new THREE.WebGLRenderTarget(Math.max(2, Math.round(bw / 2)), Math.max(2, Math.round(bh / 2)), rtOpts)
+    this.rtB = new THREE.WebGLRenderTarget(Math.max(2, Math.round(bw / 2)), Math.max(2, Math.round(bh / 2)), rtOpts)
+    this.heroRT = new THREE.WebGLRenderTarget(bw, bh, {
       minFilter: THREE.LinearFilter,
       magFilter: THREE.LinearFilter,
       depthBuffer: false,
@@ -151,7 +169,7 @@ export class ShaderHero {
       depthTest: false,
       depthWrite: false,
       uniforms: {
-        uResolution: { value: new THREE.Vector2(this.W * this.dpr, this.H * this.dpr) },
+        uResolution: { value: new THREE.Vector2(bw, bh) },
       },
     })
 
@@ -187,7 +205,7 @@ export class ShaderHero {
     window.addEventListener('pointercancel', this.onPointerUp)
     window.addEventListener('blur', this.onLeave)
     document.addEventListener('pointerleave', this.onLeave)
-    window.addEventListener('resize', this.onResize)
+    new ResizeObserver(this.onResize).observe(canvas)
     window.addEventListener('wheel', this.onWheel, { passive: true })
     window.addEventListener('scroll', this.onScroll, { passive: true })
     window.addEventListener('keydown', this.onKey)
@@ -435,11 +453,9 @@ export class ShaderHero {
   }
 
   // ---- sizing ------------------------------------------------------
-  private fieldSize(): [number, number] {
-    return [
-      Math.max(2, Math.round((this.W * this.dpr) / 2)),
-      Math.max(2, Math.round((this.H * this.dpr) / 2)),
-    ]
+  /** device-pixel size of the visible frame (canvas minus the hidden overscan) */
+  private bufSize(): [number, number] {
+    return [Math.max(2, Math.round(this.W * this.dpr)), Math.max(2, Math.round(this.H * this.dpr))]
   }
 
   private clearTargets(): void {
@@ -478,8 +494,14 @@ export class ShaderHero {
     this.renderer.render(this.heroScene, this.camera)
     this.renderer.setRenderTarget(null)
 
-    // doors
-    this.progress += (this.progressTarget - this.progress) * (1 - Math.pow(0.003, dt))
+    // the instant the user starts scrolling, the pile is sucked off the sides —
+    // and the doors don't begin to move until it's gone
+    this.crumbs.setSuction(this.progressTarget > 0.01)
+
+    // doors — held shut while the crumbs are still evacuating
+    if (this.crumbs.clear) {
+      this.progress += (this.progressTarget - this.progress) * (1 - Math.pow(0.003, dt))
+    }
     const P = this.progress
 
     // the leaves swing through the first 60% of the scroll, camera still
@@ -546,17 +568,22 @@ export class ShaderHero {
   }
 
   private onResize = (): void => {
-    this.W = window.innerWidth
-    this.H = window.innerHeight
+    const box = this.canvas.getBoundingClientRect()
+    const w = Math.max(1, box.width)
+    const h = Math.max(1, box.height - OVERSCAN)
+    if (Math.abs(w - this.W) < 0.5 && Math.abs(h - this.H) < 0.5) return
+    this.W = w
+    this.H = h
     this.dpr = Math.min(window.devicePixelRatio, 2)
     this.renderer.setPixelRatio(this.dpr)
-    this.renderer.setSize(this.W, this.H)
-    const [fw, fh] = this.fieldSize()
-    this.rtA.setSize(fw, fh)
-    this.rtB.setSize(fw, fh)
-    this.heroRT.setSize(this.W * this.dpr, this.H * this.dpr)
+    this.renderer.setSize(box.width, box.height, false)
+    this.renderer.setViewport(0, 0, this.W, this.H)
+    const [bw, bh] = this.bufSize()
+    this.rtA.setSize(Math.max(2, Math.round(bw / 2)), Math.max(2, Math.round(bh / 2)))
+    this.rtB.setSize(Math.max(2, Math.round(bw / 2)), Math.max(2, Math.round(bh / 2)))
+    this.heroRT.setSize(bw, bh)
     this.clearTargets()
-    this.heroMat.uniforms.uResolution.value.set(this.W * this.dpr, this.H * this.dpr)
+    this.heroMat.uniforms.uResolution.value.set(bw, bh)
     this.doorCam.aspect = this.W / this.H
     this.doorCam.updateProjectionMatrix()
     this.buildDoors()

@@ -21,6 +21,8 @@ interface Proto {
 interface Item {
   mesh: THREE.Object3D
   body: RAPIER.RigidBody
+  /** exit direction once the suck starts: -1 left, +1 right (assigned 50/50) */
+  dir?: number
 }
 
 /**
@@ -49,6 +51,9 @@ export class CrumbRain {
   private halfW = 1
   private spawnIndex = 0
   private crumbScale: number
+  private sucking = false
+  private spawnIv = 0
+  private suckFrames = 0
 
   constructor(opts: { parent: THREE.Object3D; crumbScale?: number }) {
     this.crumbScale = opts.crumbScale ?? 1
@@ -95,6 +100,11 @@ export class CrumbRain {
   /** call on viewport resize — only the horizontal spawn spread depends on aspect */
   layout(aspect: number): void {
     this.halfW = CRUMB_VIEW_H * aspect
+  }
+
+  /** true until a suck is under way and still has crumbs on screen — the doors wait on this */
+  get clear(): boolean {
+    return !this.sucking || this.items.length === 0
   }
 
   private async proto(kind: CrumbKind): Promise<Proto> {
@@ -157,10 +167,32 @@ export class CrumbRain {
     for (let i = 0; i < burst; i++) this.spawn(proto)
 
     let n = burst
-    const iv = window.setInterval(() => {
+    this.spawnIv = window.setInterval(() => {
+      if (this.sucking) return // suck already started; no more crumbs
       this.spawn(proto)
-      if (++n >= total) window.clearInterval(iv)
+      if (++n >= total) window.clearInterval(this.spawnIv)
     }, 55)
+  }
+
+  /**
+   * Once the user starts scrolling, the pile is sucked off the sides — half the
+   * crumbs to the left edge, half to the right — so nothing is left resting on a
+   * floor that the opening doors reveal doesn't exist. One-way and latched.
+   */
+  setSuction(on: boolean): void {
+    if (!on || this.sucking || !this.running) return // nothing to suck until a pile exists
+    this.sucking = true
+    if (this.spawnIv) window.clearInterval(this.spawnIv)
+    if (this.world && this.floorC) this.world.removeCollider(this.floorC, false)
+
+    // split the current crumbs 50/50 by x so the pile parts down the middle
+    const sorted = [...this.items].sort(
+      (a, b) => a.body.translation().x - b.body.translation().x,
+    )
+    const mid = Math.ceil(sorted.length / 2)
+    sorted.forEach((it, i) => {
+      it.dir = i < mid ? -1 : 1
+    })
   }
 
   private spawn(proto: Proto): void {
@@ -198,6 +230,8 @@ export class CrumbRain {
     const world = this.world
     if (!world || !this.running) return
 
+    if (this.sucking) this.pullAside()
+
     this.acc = Math.min(this.acc + dt, world.timestep * 3)
     let steps = 0
     while (this.acc >= world.timestep && steps < 3) {
@@ -212,5 +246,33 @@ export class CrumbRain {
       it.mesh.position.set(t.x, t.y, t.z)
       it.mesh.quaternion.set(r.x, r.y, r.z, r.w)
     }
+  }
+
+  /** drag every crumb toward its assigned edge, faster the further it's gone, then despawn it */
+  private pullAside(): void {
+    const world = this.world
+    if (!world) return
+    this.suckFrames += 1
+    const edge = this.halfW * 1.3
+    const bail = this.suckFrames > 150 // hard cap so the doors never wait forever
+
+    for (let i = this.items.length - 1; i >= 0; i--) {
+      const it = this.items[i]
+      const t = it.body.translation()
+      if (bail || Math.abs(t.x) > edge) {
+        it.mesh.visible = false
+        world.removeRigidBody(it.body)
+        this.items.splice(i, 1)
+        continue
+      }
+      const dir = it.dir ?? (t.x >= 0 ? 1 : -1)
+      it.body.setGravityScale(0, false)
+      const v = it.body.linvel()
+      // a hard yank that keeps building — cleared off screen in well under a second
+      const targetVx = dir * (7 + Math.abs(t.x) * 5)
+      it.body.setLinvel({ x: THREE.MathUtils.lerp(v.x, targetVx, 0.4), y: v.y * 0.7, z: v.z * 0.7 }, true)
+    }
+
+    if (this.items.length === 0) this.running = false
   }
 }
