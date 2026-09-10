@@ -5,6 +5,7 @@ import { TextGeometry } from 'three/examples/jsm/geometries/TextGeometry.js'
 import fullscreenVert from './shaders/fullscreen.vert'
 import fieldFrag from './shaders/field.frag'
 import paperFrag from './shaders/paper.frag'
+import galaxyFrag from './shaders/galaxy.frag'
 import { CrumbRain, CRUMB_VIEW_H } from '../ui/CrumbRain'
 
 const LOCKUP_FRACTION_DESKTOP = 0.82
@@ -17,6 +18,9 @@ const OVERSCAN = 100
 
 /** distance from the door camera to the closed doors (z = 0) */
 const DOOR_CAM_Z = 4
+/** the door camera's resting field of view — frustum maths use this, not the live
+ *  `doorCam.fov`, which the wormhole widens at runtime */
+const DOOR_FOV = 50
 /** z of the crumb pile — in front of the closed doors, so the camera leaves it behind */
 const CRUMB_Z = 2.4
 /** extrusion depth of the sign letters, as a fraction of cap height */
@@ -30,16 +34,39 @@ const FREEZE_P = 0.61
 const CAM_DIVE_END = -17
 /** section 2 — the photo tunnel behind the doors (Floema's recipe) */
 const TUNNEL_ARM_P = 0.99 // turns on once the camera has punched fully past the cubes
+const TUNNEL_REVEAL_P = 0.55 // photos start appearing one at a time just before the zoom-in
+const TUNNEL_STAGGER = 0.14 // seconds between each photo's fade-in (random order)
 const TUNNEL_RADIUS = 10 // photos ride a circle of this radius around the forward axis
 const TUNNEL_SPACING = 2 // z-gap between photos
-const TUNNEL_FOG_FAR = 78 // photos dissolve into the dark by this distance
+const TUNNEL_FOG_FAR = 78 // photos dissolve into the dark by this distance (tunnel running)
+const TUNNEL_FOG_INTRO = 210 // fog pushed back during the one-by-one reveal so it reads
 const TUNNEL_PLANES = 44 // enough to fill the corridor + a buffer
 const TUNNEL_IMG_SIZE = 1.5
 const TUNNEL_SCALE_RAND = 0.5
 const TUNNEL_SPEED_WARP = 240 // units/sec burst the instant the tunnel arms
 const TUNNEL_SPEED_IDLE = 10 // baseline drift once the burst settles
 const TUNNEL_WARP_TIME = 1.1 // seconds to ease from warp -> idle
-const TUNNEL_SCROLL_BOOST = 42 // extra units/sec at full scroll input
+const TUNNEL_SCROLL_BOOST = 60 // extra units/sec per unit of accumulated scroll input
+
+/** section 2 — the wormhole. Sustained fast scrolling inside the armed tunnel
+ *  builds a charge; easing off bleeds it away fast (but not instantly — a 0.5s
+ *  pause costs real ground). Hold it pinned at full and it locks: from there the
+ *  ride to the other side is automatic and scroll is ignored. */
+const WARP_SCROLL_THRESH = 2.2 // tunnelScroll above this counts as "scrolling hard"
+const WARP_CHARGE_TIME = 2.6 // seconds of hard scroll to fill the charge from empty
+const WARP_DISCHARGE_TIME = 0.9 // seconds to bleed a full charge back to empty when you ease off
+const WARP_HOLD_TIME = 0.6 // seconds pinned at full charge before the wormhole locks
+const WARP_CHARGE_SPEED = 520 // extra tunnel units/sec at full charge — the rush as it forms
+const WARP_FOV_GAIN = 14 // degrees the camera fov widens at full charge
+const WORMHOLE_DURATION = 3.4 // seconds of automatic fall through the throat once it locks
+const WORMHOLE_SPEED = 650 // photo-suck rush speed during the fall
+const WORM_DIST_FAR = 95 // how far ahead the vortex sits at charge 0 — a small speck
+const WORM_DIST_NEAR = 7 // how close it comes at full charge — about to swallow the view
+const WORM_SCALE_FAR = 4
+const WORM_SCALE_NEAR = 8
+const WORM_TILT = 0.34 // radians the disc leans back — the near-face-on 3D read of the ref
+const WORM_SPIN_BASE = 0.06 // rad/sec the galaxy turns at rest
+const WORM_RT_SIZE = 1024 // baked galaxy texture resolution
 
 /**
  * The hero. The off-white ground is a shader (grain + vignette); on it stands a
@@ -116,8 +143,20 @@ export class ShaderHero {
   // section 2 — the photo tunnel
   private gallery = new THREE.Group()
   private galleryPhotos: THREE.Mesh[] = []
+  private revealClock = -1 // seconds since the one-by-one reveal started (-1 = not started)
   private tunnelTime = -1 // seconds since the tunnel armed (-1 = not armed)
   private tunnelScroll = 0 // 0..1 scroll input, coasts back to 0 -> speed boost on top of idle
+  // the wormhole
+  private warpCharge = 0 // 0..1 — builds while scrolling hard, bleeds away fast when you ease off
+  private warpHold = 0 // seconds pinned at full charge (locks the wormhole at WARP_HOLD_TIME)
+  private inWormhole = false // locked in — the ride is automatic from here, scroll ignored
+  private wormholeTime = 0 // seconds since the wormhole locked
+  private arrived = false // reached the other side (undefined for now — ends on black)
+  private wormTube?: THREE.Mesh // the spinning vortex disc
+  private wormTubeMat?: THREE.ShaderMaterial
+  private wormRT?: THREE.WebGLRenderTarget // the procedural spiral-galaxy texture, baked once
+  private wormSpin = 0 // accumulated disc rotation (radians)
+  private wormFlash?: THREE.Mesh // full-view white plane for the arrival white-out
 
   constructor(canvas: HTMLCanvasElement, opts: { crumbScale?: number; spinMode?: 'cap' | 'free' } = {}) {
     this.spinMode = opts.spinMode ?? 'cap'
@@ -257,7 +296,7 @@ export class ShaderHero {
     this.fieldScene.add(new THREE.Mesh(this.quad, this.fieldMat))
     this.heroScene.add(new THREE.Mesh(this.quad, this.heroMat))
 
-    this.doorCam = new THREE.PerspectiveCamera(50, this.W / this.H, 0.1, 120)
+    this.doorCam = new THREE.PerspectiveCamera(DOOR_FOV, this.W / this.H, 0.1, 200)
     this.doorCam.position.set(0, 0, DOOR_CAM_Z)
     this.leftHinge.add(this.lettersL)
     this.rightHinge.add(this.lettersR)
@@ -271,12 +310,13 @@ export class ShaderHero {
     // onto the door frustum at that z, so at rest it reads like a screen overlay;
     // once the camera dollies past CRUMB_Z the pile is behind it, out of frame.
     this.crumbs = new CrumbRain({ parent: this.doorScene, crumbScale: opts.crumbScale })
-    const k = ((DOOR_CAM_Z - CRUMB_Z) * Math.tan(THREE.MathUtils.degToRad(this.doorCam.fov / 2))) / CRUMB_VIEW_H
+    const k = ((DOOR_CAM_Z - CRUMB_Z) * Math.tan(THREE.MathUtils.degToRad(DOOR_FOV / 2))) / CRUMB_VIEW_H
     this.crumbs.stage.position.z = CRUMB_Z
     this.crumbs.stage.scale.setScalar(k)
     this.crumbs.layout(this.W / this.H)
 
     this.clearTargets()
+    if (this.spinMode === 'free') this.bakeWormhole()
     void this.loadFonts().then(() => this.layoutLetters())
 
     window.addEventListener('pointermove', this.onPointerMove)
@@ -296,7 +336,7 @@ export class ShaderHero {
   // ---- doors ------------------------------------------------------
   private buildDoors(): void {
     // the frustum cross-section at the closed doors (z = 0)
-    const vh = 2 * DOOR_CAM_Z * Math.tan(THREE.MathUtils.degToRad(this.doorCam.fov / 2))
+    const vh = 2 * DOOR_CAM_Z * Math.tan(THREE.MathUtils.degToRad(DOOR_FOV / 2))
     const vw = vh * (this.W / this.H)
     const pw = vw / 2
     const over = vw * 0.006
@@ -434,11 +474,11 @@ export class ShaderHero {
 
   /**
    * Section 2 — a photo tunnel, Floema's recipe. Planes ride a circle of radius
-   * TUNNEL_RADIUS around the forward axis, spread by the golden angle, spaced
-   * TUNNEL_SPACING apart in z, all bunched behind the fog to start (invisible). Once
-   * the camera is past the cubes the tunnel arms: a warp burst that eases to an idle
-   * drift, plus a scroll boost. THREE.Fog (= the dark behind) does all the fade; a
-   * plane that passes the camera recycles to the far end. Placeholders: grey cards.
+   * TUNNEL_RADIUS around the forward axis, spread by the golden angle, SPACING apart
+   * in z. Just before the zoom-in they fade in one at a time, deep in the distance
+   * (fog pushed back so they read). Then, once the camera is past the cubes, the
+   * tunnel arms: fog closes to TUNNEL_FOG_FAR, a warp burst eases to an idle drift
+   * (+ scroll boost), and a plane that passes the camera recycles to the far end.
    */
   private buildGallery(): void {
     let seed = 0x9e37
@@ -448,6 +488,12 @@ export class ShaderHero {
     }
     const golden = Math.PI * (3 - Math.sqrt(5))
     const geo = new THREE.PlaneGeometry(1, 1)
+    // each photo appears in a shuffled order, not around-the-ring
+    const order = Array.from({ length: TUNNEL_PLANES }, (_, i) => i)
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1))
+      ;[order[i], order[j]] = [order[j], order[i]]
+    }
     const NDISTINCT = 12
     const texes: THREE.CanvasTexture[] = []
     for (let k = 0; k < NDISTINCT; k++) {
@@ -477,20 +523,116 @@ export class ShaderHero {
     }
     for (let i = 0; i < TUNNEL_PLANES; i++) {
       const tex = texes[i % NDISTINCT]
-      const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false }))
+      const m = new THREE.Mesh(
+        geo,
+        new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, opacity: 0 }),
+      )
       const a = i * golden
+      m.userData.ang = a
       m.position.x = Math.cos(a) * TUNNEL_RADIUS
       m.position.y = Math.sin(a) * TUNNEL_RADIUS
-      m.position.z = CAM_DIVE_END - TUNNEL_FOG_FAR - i * TUNNEL_SPACING // bunched behind the fog
+      m.position.z = CAM_DIVE_END - 26 - i * TUNNEL_SPACING // scattered deep, but shallow enough to read
+      m.userData.z0 = m.position.z
+      m.userData.revealAt = order[i] * TUNNEL_STAGGER // seconds after the reveal clock starts
       const aspect = tex.image.width / tex.image.height
       const base = TUNNEL_IMG_SIZE + rng() * TUNNEL_SCALE_RAND
       if (aspect >= 1) m.scale.set(base * aspect, base, 1)
       else m.scale.set(base, base / aspect, 1)
+      m.userData.s0 = m.scale.clone() // resting scale — the charge stretches them into streaks
       this.galleryPhotos.push(m)
       this.gallery.add(m)
     }
+    this.gallery.visible = false
     this.doorScene.add(this.gallery)
-    this.doorScene.fog = new THREE.Fog(0x000000, 0.1, TUNNEL_FOG_FAR)
+    this.doorScene.fog = new THREE.Fog(0x000000, 0.1, TUNNEL_FOG_INTRO)
+
+    // the wormhole — a spiral-galaxy disc (procedurally baked in bakeWormhole()).
+    // It's a tilted disc far down the corridor; sustained fast scroll grows it and
+    // brings it closer (stepGallery), the disc spins about its own axis the whole
+    // time, and once it fills the view the fall through the core goes automatic
+    // (stepWormhole). Black space keyed out so a small/far disc doesn't occlude the
+    // tunnel behind it.
+    this.wormTubeMat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      uniforms: {
+        uMap: { value: this.wormRT ? this.wormRT.texture : null },
+        uGrow: { value: 0 }, // 0..1 charge / approach
+        uBloom: { value: 0 }, // 0..1 final white-out as you fall through the core
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: `
+        precision highp float;
+        uniform sampler2D uMap;
+        uniform float uGrow;
+        uniform float uBloom;
+        varying vec2 vUv;
+        void main() {
+          // zoom into the core as it energises / as you fall in
+          vec2 uv = 0.5 + (vUv - 0.5) / (1.0 + uGrow * 0.25 + uBloom * 3.2);
+          vec3 col = texture2D(uMap, uv).rgb * (1.0 + uGrow * 0.25);
+          float luma = dot(col, vec3(0.299, 0.587, 0.114));
+          float alpha = smoothstep(0.008, 0.10, luma); // key out the black surround
+
+          col = mix(col, vec3(1.0), uBloom);
+          alpha = max(alpha, uBloom);
+          gl_FragColor = vec4(col, alpha);
+        }`,
+    })
+    this.wormTube = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), this.wormTubeMat)
+    this.wormTube.visible = false
+    this.wormTube.frustumCulled = false
+    this.doorScene.add(this.wormTube)
+
+    this.wormFlash = new THREE.Mesh(
+      new THREE.PlaneGeometry(2, 2),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, depthTest: false, depthWrite: false }),
+    )
+    this.wormFlash.visible = false
+    this.wormFlash.frustumCulled = false
+    this.wormFlash.renderOrder = 999
+    this.doorScene.add(this.wormFlash)
+  }
+
+  /**
+   * Bake the wormhole's spiral-galaxy texture once. A procedural face-on galaxy —
+   * two logarithmic-spiral arms, a dense star field biased to the arms and centre,
+   * dark dust lanes, rose-pink HII knots, a hot bulge — rendered to wormRT. The
+   * disc mesh just leans it back and spins it (like the reference model).
+   */
+  private bakeWormhole(): void {
+    this.wormRT = new THREE.WebGLRenderTarget(WORM_RT_SIZE, WORM_RT_SIZE, {
+      minFilter: THREE.LinearMipmapLinearFilter,
+      magFilter: THREE.LinearFilter,
+      depthBuffer: false,
+      stencilBuffer: false,
+      generateMipmaps: true,
+    })
+    this.wormRT.texture.colorSpace = THREE.SRGBColorSpace
+
+    const genMat = new THREE.ShaderMaterial({
+      vertexShader: fullscreenVert,
+      fragmentShader: galaxyFrag,
+      depthTest: false,
+      depthWrite: false,
+    })
+    const scene = new THREE.Scene()
+    const mesh = new THREE.Mesh(this.quad, genMat)
+    scene.add(mesh)
+
+    const prev = this.renderer.getClearColor(new THREE.Color()).getHex()
+    this.renderer.setClearColor(0x000000, 1)
+    this.renderer.setRenderTarget(this.wormRT)
+    this.renderer.clear()
+    this.renderer.render(scene, this.camera)
+    this.renderer.setRenderTarget(null)
+    this.renderer.setClearColor(prev, 1)
+
+    scene.remove(mesh)
+    genMat.dispose()
+    if (this.wormTubeMat) this.wormTubeMat.uniforms.uMap.value = this.wormRT.texture
   }
 
   // ---- the sign -----------------------------------------------------
@@ -755,7 +897,7 @@ export class ShaderHero {
     if (!this.fonts) return
     this.disposeLetters()
 
-    const vh = 2 * DOOR_CAM_Z * Math.tan(THREE.MathUtils.degToRad(this.doorCam.fov / 2))
+    const vh = 2 * DOOR_CAM_Z * Math.tan(THREE.MathUtils.degToRad(DOOR_FOV / 2))
     const vw = vh * (this.W / this.H)
     const targetW = vw * (this.W < 700 ? LOCKUP_FRACTION_MOBILE : LOCKUP_FRACTION_DESKTOP)
 
@@ -914,12 +1056,21 @@ export class ShaderHero {
     // and the doors don't begin to move until it's gone
     this.crumbs.setSuction(this.progressTarget > 0.01)
 
-    // doors — held shut while the crumbs are still evacuating
-    if (this.crumbs.clear) {
-      this.progress += (this.progressTarget - this.progress) * (1 - Math.pow(0.003, dt))
+    // doors — held shut while the crumbs are still evacuating. Scroll made during
+    // that wait must NOT bank: pin the target just past the suction threshold so it
+    // can't accumulate; the hero only starts building once the crumbs are gone.
+    if (!this.crumbs.clear) {
+      this.manual = Math.min(this.manual, 0.02)
+      this.progressTarget = this.manual
+    } else {
+      // gentle cinematic smoothing for normal scrolling; the further the target is
+      // (scrolling hard) the faster it catches up, so a violent scroll rips through.
+      const gap = this.progressTarget - this.progress
+      const k = Math.min(1, (1 - Math.pow(0.003, dt)) + Math.min(0.55, Math.abs(gap) * 4))
+      this.progress += gap * k
     }
     const P = this.progress
-    const vh = 2 * DOOR_CAM_Z * Math.tan(THREE.MathUtils.degToRad(this.doorCam.fov / 2))
+    const vh = 2 * DOOR_CAM_Z * Math.tan(THREE.MathUtils.degToRad(DOOR_FOV / 2))
     const vw = vh * (this.W / this.H)
 
     const fly = THREE.MathUtils.clamp((P - 0.3) / 0.7, 0, 1)
@@ -1001,32 +1152,190 @@ export class ShaderHero {
     this.prevPointer.copy(this.pointer)
   }
 
-  /** advance the photo tunnel — Floema's model: warp burst -> idle drift, + a scroll
-   *  boost, recycle past the camera, THREE.Fog does the fade */
+  /** advance the photo tunnel: photos appear one at a time just before the zoom-in,
+   *  then Floema's warp burst -> idle drift + a scroll-RATE speed boost + fog + recycle.
+   *  Sustained fast scrolling here charges the wormhole (see stepWormhole). */
   private stepGallery(dt: number, P: number, camZ: number): void {
-    if (P < TUNNEL_ARM_P) {
-      this.tunnelTime = -1 // parked behind the fog, invisible
-      this.tunnelScroll = 0
-      return
-    }
-    if (this.tunnelTime < 0) this.tunnelTime = 0
-    this.tunnelTime += dt
-    this.tunnelScroll = Math.max(0, this.tunnelScroll - dt * 0.55) // coasts back to idle
+    // photos start appearing just before the zoom-in; scrolling back drops them
+    if (P < TUNNEL_REVEAL_P - 0.06) this.revealClock = -1
+    else if (this.revealClock < 0) this.revealClock = 0
+    else this.revealClock += dt
 
-    const expo = (x: number): number => (x >= 1 ? 1 : 1 - 2 ** (-6 * x))
-    const warp = expo(THREE.MathUtils.clamp(this.tunnelTime / TUNNEL_WARP_TIME, 0, 1))
-    const speed =
-      THREE.MathUtils.lerp(TUNNEL_SPEED_WARP, TUNNEL_SPEED_IDLE, warp) + expo(this.tunnelScroll) * TUNNEL_SCROLL_BOOST
+    this.gallery.visible = this.revealClock >= 0
+    if (!this.gallery.visible) return
 
-    let backZ = Infinity
-    for (const m of this.galleryPhotos) if (m.position.z < backZ) backZ = m.position.z
-    for (const m of this.galleryPhotos) {
-      m.position.z += speed * dt
-      if (m.position.z > camZ) {
-        m.position.z = backZ - TUNNEL_SPACING // recycle to just behind the furthest one
-        backZ = m.position.z
+    const armed = P >= TUNNEL_ARM_P
+    const fog = this.doorScene.fog as THREE.Fog
+
+    // tunnelScroll is a decaying accumulator of scroll INPUT — 3 flicks/sec really is
+    // ~3x faster than 1 flick/sec, and it's not capped at 1
+    this.tunnelScroll = Math.max(0, this.tunnelScroll * Math.pow(0.1, dt) - dt * 0.6)
+
+    // ---- wormhole charge -------------------------------------------------
+    // scrolling hard and continuously (tunnelScroll over the threshold) fills
+    // warpCharge; anything less bleeds it away over WARP_DISCHARGE_TIME — fast,
+    // but a brief pause doesn't zero it. Pinned at full for WARP_HOLD_TIME it
+    // locks and the ride goes automatic.
+    if (!this.inWormhole) {
+      if (armed && this.tunnelScroll > WARP_SCROLL_THRESH) {
+        const over = 1 + (this.tunnelScroll - WARP_SCROLL_THRESH) * 0.35 // scroll harder, fill faster
+        this.warpCharge = Math.min(1, this.warpCharge + (dt / WARP_CHARGE_TIME) * over)
+        this.warpHold = this.warpCharge >= 1 ? this.warpHold + dt : 0
+      } else {
+        this.warpCharge = Math.max(0, this.warpCharge - dt / WARP_DISCHARGE_TIME)
+        this.warpHold = 0
+      }
+      if (this.warpHold >= WARP_HOLD_TIME) {
+        this.inWormhole = true
+        this.wormholeTime = 0
+        console.info('[hero] wormhole: locked')
       }
     }
+
+    if (this.inWormhole) {
+      this.stepWormhole(dt, camZ)
+      return
+    }
+
+    // eased charge — drives every visible reaction, so the corridor springs
+    // straight back the instant you ease off
+    const c = this.warpCharge
+    const cc = c * c * (3 - 2 * c)
+
+    const fogTarget = armed ? THREE.MathUtils.lerp(TUNNEL_FOG_FAR, TUNNEL_FOG_FAR * 0.55, cc) : TUNNEL_FOG_INTRO
+    fog.far += (fogTarget - fog.far) * (1 - Math.pow(0.02, dt))
+
+    if (armed) {
+      if (this.tunnelTime < 0) this.tunnelTime = 0
+      this.tunnelTime += dt
+      const expo = (x: number): number => (x >= 1 ? 1 : 1 - 2 ** (-6 * x))
+      const warp = expo(THREE.MathUtils.clamp(this.tunnelTime / TUNNEL_WARP_TIME, 0, 1))
+      const speed =
+        THREE.MathUtils.lerp(TUNNEL_SPEED_WARP, TUNNEL_SPEED_IDLE, warp) +
+        this.tunnelScroll * TUNNEL_SCROLL_BOOST +
+        cc * WARP_CHARGE_SPEED
+      let backZ = Infinity
+      for (const m of this.galleryPhotos) if (m.position.z < backZ) backZ = m.position.z
+      for (const m of this.galleryPhotos) {
+        m.position.z += speed * dt
+        if (m.position.z > camZ) {
+          m.position.z = backZ - TUNNEL_SPACING
+          backZ = m.position.z
+        }
+      }
+    } else {
+      this.tunnelTime = -1
+    }
+
+    // photos stretch into vertical streaks as the charge builds — "as imagens vão
+    // se distorcendo e passando muito rápido". They stay on their normal ring; the
+    // vortex is the separate thing that grows ahead.
+    for (const m of this.galleryPhotos) {
+      const revealAt = m.userData.revealAt as number
+      ;(m.material as THREE.MeshBasicMaterial).opacity = THREE.MathUtils.smoothstep(
+        this.revealClock,
+        revealAt,
+        revealAt + 0.4,
+      )
+      if (!armed) m.position.z = m.userData.z0 as number
+      const a = m.userData.ang as number
+      m.position.x = Math.cos(a) * TUNNEL_RADIUS
+      m.position.y = Math.sin(a) * TUNNEL_RADIUS
+      const s0 = m.userData.s0 as THREE.Vector3
+      m.scale.set(s0.x * (1 - cc * 0.55), s0.y * (1 + cc * 4.5), 1)
+    }
+
+    // the vortex, far down the corridor: hidden at rest, and as the charge builds
+    // it grows and comes closer — "vê um pequeno buraco de minhoca que vai crescendo
+    // até chegar". At full charge it's about to swallow the view and the fall locks.
+    const worm = this.wormTube!
+    worm.visible = armed && cc > 0.004
+    if (worm.visible) {
+      this.wormSpin += dt * (WORM_SPIN_BASE + cc * 0.6) // spins faster as it energises
+      this.placeWorm(
+        camZ,
+        THREE.MathUtils.lerp(WORM_DIST_FAR, WORM_DIST_NEAR, cc),
+        THREE.MathUtils.lerp(WORM_SCALE_FAR, WORM_SCALE_NEAR, cc),
+      )
+      this.wormTubeMat!.uniforms.uGrow.value = cc
+      this.wormTubeMat!.uniforms.uBloom.value = 0
+    }
+
+    this.setDoorFov(THREE.MathUtils.lerp(DOOR_FOV, DOOR_FOV + WARP_FOV_GAIN, cc))
+  }
+
+  /** sit the galaxy disc `dist` ahead of the camera, leaning back by WORM_TILT and
+   *  spun to wormSpin about its own axis (the reference model's "Plane rotating") */
+  private placeWorm(camZ: number, dist: number, scale: number): void {
+    const w = this.wormTube!
+    w.position.set(this.doorCam.position.x, this.doorCam.position.y, camZ - dist)
+    w.rotation.set(WORM_TILT, 0, this.wormSpin)
+    w.scale.setScalar(scale)
+  }
+
+  /** the automatic fall through the throat, once the vortex has grown to fill the
+   *  view. Scroll is ignored: the vortex rushes the last of the way in and blooms
+   *  to white while the photos are pulled into the centre, then it's the other
+   *  side — undefined for now, so it holds on black. */
+  private stepWormhole(dt: number, camZ: number): void {
+    this.wormholeTime += dt
+    const t = this.wormholeTime
+    const fog = this.doorScene.fog as THREE.Fog
+    const worm = this.wormTube!
+    const flash = this.wormFlash!
+
+    fog.far += (400 - fog.far) * (1 - Math.pow(0.02, dt)) // let the void open right up
+
+    // disorienting roll as you go through (set before anything copies the camera orientation)
+    this.doorCam.rotation.z = Math.sin(t * 1.1) * 0.18 + t * 0.35
+    this.setDoorFov(DOOR_FOV + WARP_FOV_GAIN)
+
+    // the disc closes the last of the distance, spins up and blooms
+    const k = THREE.MathUtils.smoothstep(t, 0, WORMHOLE_DURATION)
+    worm.visible = t < WORMHOLE_DURATION - 0.1
+    if (worm.visible) {
+      this.wormSpin += dt * (1.4 + k * 5.0)
+      this.placeWorm(camZ, THREE.MathUtils.lerp(WORM_DIST_NEAR, 1.2, k * k), THREE.MathUtils.lerp(WORM_SCALE_NEAR, WORM_SCALE_NEAR * 2.6, k))
+      const mat = this.wormTubeMat!
+      mat.uniforms.uGrow.value = 1
+      mat.uniforms.uBloom.value = THREE.MathUtils.smoothstep(t, WORMHOLE_DURATION - 1.6, WORMHOLE_DURATION - 0.3)
+    } else if (this.gallery.visible) {
+      this.gallery.visible = false
+    }
+
+    // photos pulled into the centre and gone
+    const suck = THREE.MathUtils.smoothstep(t, 0, 1.1)
+    for (const m of this.galleryPhotos) {
+      const a = (m.userData.ang as number) + dt * (2 + suck * 7)
+      m.userData.ang = a
+      const r = TUNNEL_RADIUS * (1 - suck) * (1 - suck)
+      m.position.x = Math.cos(a) * r
+      m.position.y = Math.sin(a) * r
+      m.position.z += (200 + suck * WORMHOLE_SPEED * 2) * dt
+      ;(m.material as THREE.MeshBasicMaterial).opacity = Math.max(0, 1 - suck * 1.3)
+    }
+
+    // hard white at the peak of the bloom, then fall away to black (other side TBD)
+    flash.visible = true
+    flash.quaternion.copy(this.doorCam.quaternion)
+    flash.position.set(this.doorCam.position.x, this.doorCam.position.y, this.doorCam.position.z - 0.5)
+    const up = THREE.MathUtils.smoothstep(t, WORMHOLE_DURATION - 0.7, WORMHOLE_DURATION - 0.15)
+    const down = THREE.MathUtils.smoothstep(t, WORMHOLE_DURATION - 0.05, WORMHOLE_DURATION + 0.9)
+    ;(flash.material as THREE.MeshBasicMaterial).opacity = Math.max(0, up - down)
+
+    if (t >= WORMHOLE_DURATION + 0.9) {
+      flash.visible = false
+      if (!this.arrived) {
+        this.arrived = true
+        console.info('[hero] wormhole: arrived — other side TBD')
+      }
+    }
+  }
+
+  private setDoorFov(fov: number): void {
+    if (Math.abs(this.doorCam.fov - fov) < 0.05) return
+    this.doorCam.fov = fov
+    this.doorCam.updateProjectionMatrix()
   }
 
   private hasFocus(): boolean {
@@ -1061,10 +1370,11 @@ export class ShaderHero {
   }
 
   private onWheel = (e: WheelEvent): void => {
-    if (this.locked) return
+    if (this.locked || this.inWormhole) return
     if (this.spinMode === 'free' && this.manual >= 1) {
-      // hero scroll is spent — the wheel now boosts the tunnel speed (never reverses)
-      this.tunnelScroll = THREE.MathUtils.clamp(this.tunnelScroll + e.deltaY * 0.0011, 0, 1)
+      // hero scroll is spent — every flick (either direction) feeds the tunnel speed
+      // AND charges the wormhole; decays fast, so the RATE of flicking sets both.
+      this.tunnelScroll = Math.min(6, this.tunnelScroll + Math.abs(e.deltaY) * 0.0016)
       return
     }
     this.manual = THREE.MathUtils.clamp(this.manual + e.deltaY / 2600, 0, 1)
@@ -1078,12 +1388,12 @@ export class ShaderHero {
   }
 
   private onKey = (e: KeyboardEvent): void => {
-    if (this.locked) return
+    if (this.locked || this.inWormhole) return
     const step: Record<string, number> = { ArrowDown: 0.07, PageDown: 0.22, ' ': 0.22, ArrowUp: -0.07, PageUp: -0.22 }
     const s = step[e.key]
     if (s === undefined) return
     if (this.spinMode === 'free' && this.manual >= 1) {
-      this.tunnelScroll = THREE.MathUtils.clamp(this.tunnelScroll + s * 1.6, 0, 1)
+      this.tunnelScroll = Math.min(6, this.tunnelScroll + Math.abs(s) * 3)
       return
     }
     this.manual = THREE.MathUtils.clamp(this.manual + s, 0, 1)
