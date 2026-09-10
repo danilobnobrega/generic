@@ -17,8 +17,6 @@ const OVERSCAN = 100
 
 /** distance from the door camera to the closed doors (z = 0) */
 const DOOR_CAM_Z = 4
-/** how far each leaf swings open, radians */
-const DOOR_SWING = 2.2
 /** z of the crumb pile — in front of the closed doors, so the camera leaves it behind */
 const CRUMB_Z = 2.4
 /** extrusion depth of the sign letters, as a fraction of cap height */
@@ -59,6 +57,11 @@ export class ShaderHero {
   private rightHinge = new THREE.Group()
   private leftPanel?: THREE.Mesh
   private rightPanel?: THREE.Mesh
+  // the cube's non-front faces — concrete grey so the tumble reads as a solid box
+  private blockMat = new THREE.MeshStandardMaterial({ color: 0x6b665b, roughness: 0.85 })
+  // 'free' mode tagline text — dark sign material, own instance so it can be tuned
+  private tagMat = new THREE.MeshStandardMaterial({ color: 0x121214, roughness: 0.62, metalness: 0 })
+  private cubeSide = 1 // real edge length of each door-cube, set in buildDoors
   private _look = new THREE.Vector3()
 
   private letterMat!: THREE.ShaderMaterial
@@ -81,11 +84,14 @@ export class ShaderHero {
   private down = 0
   private pointerInside = false
 
+  private spinMode: 'cap' | 'free'
+
   private progress = 0
   private progressTarget = 0
   private manual = 0
 
-  constructor(canvas: HTMLCanvasElement, opts: { crumbScale?: number } = {}) {
+  constructor(canvas: HTMLCanvasElement, opts: { crumbScale?: number; spinMode?: 'cap' | 'free' } = {}) {
+    this.spinMode = opts.spinMode ?? 'cap'
     this.canvas = canvas
     // Size to the canvas's own laid-out box — and pass the RAW fractional size to
     // setSize. Rounding it here makes the backing store a pixel short of the box,
@@ -97,6 +103,12 @@ export class ShaderHero {
 
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' })
     this.renderer.setPixelRatio(this.dpr)
+    // real shadows in the door scene: the concrete slab occludes its key light from
+    // the raised tagline letters until the cube has turned far enough, so the letters
+    // sit in the slab's shadow — not just dimly lit — and then reveal their volume
+    // through self-shadowing once the light rakes across.
+    this.renderer.shadowMap.enabled = true
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap
     this.renderer.setSize(box.width, box.height, false) // backing store covers the whole oversized canvas
     this.renderer.setViewport(0, 0, this.W, this.H) // ...but render only the visible bottom part
 
@@ -219,48 +231,64 @@ export class ShaderHero {
     const vh = 2 * DOOR_CAM_Z * Math.tan(THREE.MathUtils.degToRad(this.doorCam.fov / 2))
     const vw = vh * (this.W / this.H)
     const pw = vw / 2
-    // small bleed so a sub-pixel seam or edge never shows the space behind
     const over = vw * 0.006
-    const PW = pw + 2 * over
-    const PH = vh + 2 * over
+
+    // a REAL cube: one edge length for all three sides. It covers its half of the
+    // frame (whichever of half-width / height is bigger) and overshoots the other
+    // way off-screen. Front (+z) face at local z = 0 when closed.
+    const S = Math.max(pw, vh) + 2 * over
+    this.cubeSide = S
 
     for (const p of [this.leftPanel, this.rightPanel]) {
       if (!p) continue
-      p.geometry.dispose() // material is shared (this.doorMat) — never disposed here
+      p.geometry.dispose() // materials are shared — never disposed here
       p.parent?.remove(p)
     }
 
-    // UVs are baked from each vertex's closed-state world position so that
-    // worldX -vw/2..0 -> u 0..0.5 (left leaf) and 0..vw/2 -> u 0.5..1 (right),
-    // worldY -vh/2..vh/2 -> v 0..1. The bleed spills slightly past [0,1] and
-    // clamps to the edge texel — outside the frustum, never seen.
-    const bake = (g: THREE.PlaneGeometry, hingeX: number, panelX: number): void => {
+    // paper (heroRT) with baked UVs on the front face; concrete on the other five
+    const bakeFront = (g: THREE.BufferGeometry, faceX: number): void => {
       const pos = g.attributes.position
       const uv = g.attributes.uv
       for (let i = 0; i < pos.count; i++) {
-        const worldX = hingeX + panelX + pos.getX(i)
+        if (pos.getZ(i) < -1e-4) continue // front face only (translated to z = 0)
+        const worldX = faceX + pos.getX(i)
         const worldY = pos.getY(i)
         uv.setXY(i, (worldX + vw / 2) / vw, (worldY + vh / 2) / vh)
       }
       uv.needsUpdate = true
     }
-    this.leftHinge.position.set(-vw / 2, 0, 0)
-    this.leftHinge.rotation.set(0, 0, 0)
-    const leftPanelX = over - PW / 2 + vw / 2
-    const lg = new THREE.PlaneGeometry(PW, PH)
-    bake(lg, -vw / 2, leftPanelX)
-    this.leftPanel = new THREE.Mesh(lg, this.doorMat)
-    this.leftPanel.position.x = leftPanelX
-    this.leftHinge.add(this.leftPanel)
+    // BoxGeometry group order: +x, -x, +y, -y, +z(front), -z. At the 147° cap the
+    // OUTER face shows: -x on the left cube, +x on the right — that's where the tagline goes.
+    const mats = [this.blockMat, this.blockMat, this.blockMat, this.blockMat, this.doorMat, this.blockMat]
 
-    this.rightHinge.position.set(vw / 2, 0, 0)
-    this.rightHinge.rotation.set(0, 0, 0)
-    const rightPanelX = -over + PW / 2 - vw / 2
-    const rg = new THREE.PlaneGeometry(PW, PH)
-    bake(rg, vw / 2, rightPanelX)
-    this.rightPanel = new THREE.Mesh(rg, this.doorMat)
-    this.rightPanel.position.x = rightPanelX
-    this.rightHinge.add(this.rightPanel)
+    // dir -1 = left cube (its inner/right edge at the seam x=0), +1 = right cube
+    const buildLeaf = (hinge: THREE.Group, dir: -1 | 1): THREE.Mesh => {
+      hinge.position.set((dir * vw) / 2, 0, 0)
+      hinge.rotation.set(0, 0, 0)
+      const cx = -dir * (S / 2 - over) // cube centre so the seam edge lands on x = 0
+      const g = new THREE.BoxGeometry(S, S, S)
+      g.translate(0, 0, -S / 2) // front face -> local z = 0
+      bakeFront(g, (dir * vw) / 2 + cx)
+      const mesh = new THREE.Mesh(g, mats)
+      mesh.position.x = cx
+      hinge.add(mesh)
+      return mesh
+    }
+
+    this.leftPanel = buildLeaf(this.leftHinge, -1)
+    this.rightPanel = buildLeaf(this.rightHinge, 1)
+
+    if (this.spinMode === 'free') {
+      // isolate each cube on its own light layer (see buildSpaceBehind)
+      this.leftPanel.layers.set(1)
+      this.rightPanel.layers.set(2)
+      // the slab casts the shadow that hides the tagline letters; it also receives
+      // (self-shading as it turns)
+      for (const p of [this.leftPanel, this.rightPanel]) {
+        p.castShadow = true
+        p.receiveShadow = true
+      }
+    }
   }
 
   /** placeholder space beyond the doors — replace with section 2 */
@@ -280,8 +308,53 @@ export class ShaderHero {
 
     const glow = new THREE.PointLight(0xffe6c4, 20, 30)
     glow.position.set(0, 1.5, -9)
+    this.doorScene.add(floor, wall, glow)
 
-    this.doorScene.add(floor, wall, glow, new THREE.HemisphereLight(0x3c3934, 0x191715, 0.45))
+    if (this.spinMode !== 'free') {
+      const key = new THREE.DirectionalLight(0xfff4e6, 2.4) // soft key from the camera side
+      key.position.set(3, 4, 7)
+      this.doorScene.add(key, new THREE.HemisphereLight(0x45423c, 0x26241f, 0.5))
+      return
+    }
+
+    // 'free' mode: the two door-cubes are lit ONLY by the lights below — nothing else
+    // in the scene (not the glow, not the room fill) can spill onto them. That's what
+    // the layers are for: the left panel + its tagline are on layer 1, the right on
+    // layer 2, and each key light + the fill match. Each outer (tagline) face is
+    // turned AWAY from its key through the whole swing and only crosses into the
+    // light once it has rotated past ~123° — it comes out of its own shadow purely
+    // by turning. Sources sit off to the far side, set back into the room, mirrored.
+    const shadow = (l: THREE.DirectionalLight): void => {
+      l.castShadow = true
+      l.shadow.mapSize.set(2048, 2048)
+      l.shadow.camera.near = 0.5
+      l.shadow.camera.far = 40
+      l.shadow.camera.left = -9
+      l.shadow.camera.right = 9
+      l.shadow.camera.top = 9
+      l.shadow.camera.bottom = -9
+      l.shadow.bias = -0.0004
+      l.shadow.normalBias = 0.03
+    }
+    const keyL = new THREE.DirectionalLight(0xffe8cc, 1.3)
+    keyL.position.set(8.4, 2.0, -5.45)
+    keyL.layers.set(1)
+    shadow(keyL)
+    const keyR = new THREE.DirectionalLight(0xffe8cc, 1.3)
+    keyR.position.set(-8.4, 2.0, -5.45)
+    keyR.layers.set(2)
+    shadow(keyR)
+    // barely-there fill. sky === ground so it's fully normal-independent: while the
+    // slab shadow covers the letters, face and raised letters take the exact same
+    // flat value and the relief is invisible. It shows only once keyL rakes across.
+    const fill = new THREE.HemisphereLight(0x3a3732, 0x3a3732, 0.09)
+    fill.layers.set(1)
+    fill.layers.enable(2)
+    // dim ambient for the placeholder room itself — layer 0, never touches the cubes
+    const room = new THREE.HemisphereLight(0x45423c, 0x26241f, 0.3)
+    this.doorScene.add(keyL, keyR, fill, room)
+    this.doorCam.layers.enable(1)
+    this.doorCam.layers.enable(2)
   }
 
   // ---- the sign -----------------------------------------------------
@@ -341,6 +414,7 @@ export class ShaderHero {
           gl_FragColor = vec4(mix(rest, chrome, k), 1.0);
         }`,
     })
+
   }
 
   private async loadFonts(): Promise<void> {
@@ -550,6 +624,56 @@ export class ShaderHero {
     const we = new THREE.Mesh(weGeo, this.letterMat)
     we.position.set(vw / 2 - halfW + size * 0.03, yOff + halfH + size * 0.06, zOff)
     this.lettersL.add(we)
+
+    // tagline — 'free' mode: on the cube's BACK face (the one that faces the
+    // camera at the 147° cap). 'cap' mode: on the inner/seam face (shows at 90°).
+    const cs = this.cubeSide
+    const cxL = cs / 2 - vw * 0.006 // left cube centre offset inside its hinge (matches buildLeaf)
+    const tagW = cs * 0.7
+    const makeTag = (text: string): THREE.Mesh => {
+      const pr = new TextGeometry(text, { font: this.fonts!.italic, size: 1, depth: 0.001, bevelEnabled: false })
+      pr.computeBoundingBox()
+      const s = tagW / (pr.boundingBox!.max.x - pr.boundingBox!.min.x)
+      pr.dispose()
+      const g = new TextGeometry(text, {
+        font: this.fonts!.italic,
+        size: s,
+        depth: s * 0.14,
+        curveSegments: 4,
+        bevelEnabled: true,
+        bevelThickness: s * 0.02,
+        bevelSize: s * 0.02,
+        bevelSegments: 1,
+      })
+      g.computeBoundingBox()
+      const gb = g.boundingBox!
+      g.translate(-(gb.max.x + gb.min.x) / 2, -(gb.max.y + gb.min.y) / 2, 0)
+      return new THREE.Mesh(g, this.spinMode === 'free' ? this.tagMat : this.letterMat)
+    }
+
+    const tagL = makeTag('We do things')
+    const tagR = makeTag('for people.')
+    if (this.spinMode === 'free') {
+      // left cube: on its -x (outer) face, facing -x, just outside it.
+      tagL.rotation.y = -Math.PI / 2
+      tagL.position.set(cxL - cs / 2 - 0.05, yOff, -cs / 2)
+      tagL.layers.set(1) // same light layer as leftPanel
+      tagL.castShadow = true // relief self-shadows once lit
+      tagL.receiveShadow = true // sits in the slab's shadow until then
+      // right cube: mirror — on its +x (outer) face
+      tagR.rotation.y = Math.PI / 2
+      tagR.position.set(-(cxL - cs / 2 - 0.05), yOff, -cs / 2)
+      tagR.layers.set(2)
+      tagR.castShadow = true
+      tagR.receiveShadow = true
+    } else {
+      tagL.rotation.y = Math.PI / 2 // inner (seam) face
+      tagL.position.set(vw / 2 - 0.02, yOff, -cs / 2)
+      tagR.rotation.y = -Math.PI / 2
+      tagR.position.set(-vw / 2 + 0.02, yOff, -cs / 2)
+    }
+    this.lettersL.add(tagL)
+    this.lettersR.add(tagR)
   }
 
   // ---- sizing ------------------------------------------------------
@@ -603,20 +727,46 @@ export class ShaderHero {
       this.progress += (this.progressTarget - this.progress) * (1 - Math.pow(0.003, dt))
     }
     const P = this.progress
+    const vh = 2 * DOOR_CAM_Z * Math.tan(THREE.MathUtils.degToRad(this.doorCam.fov / 2))
+    const vw = vh * (this.W / this.H)
 
-    // the leaves swing through the first 60% of the scroll, camera still
-    const openP = THREE.MathUtils.clamp(P / 0.6, 0, 1)
-    const open = openP * openP * (3 - 2 * openP)
-    // the camera only starts moving once the leaves are ~half open, then pushes through
-    const dollyP = THREE.MathUtils.clamp((P - 0.35) / 0.65, 0, 1)
-    const dolly = dollyP * dollyP * (3 - 2 * dollyP)
+    // free mode: the whole transition freezes once the cubes hit the 147° frame
+    // (~85% scroll) — no more rotation AND no more recede past that point
+    const mp = this.spinMode === 'free' ? Math.min(P, 0.85) : P
+
+    const fly = THREE.MathUtils.clamp((mp - 0.3) / 0.7, 0, 1)
+    const f = fly * fly // gentle ease-in — no lurch when they launch
+    const fwd = -f * 13 // recede into -z; the camera follows more slowly so distance grows
+    const xPull = 1 - f * 0.3 // slight drift toward centre
 
     this.letterMat.uniforms.uField.value = this.rtA.texture
-    this.letterMat.uniforms.uOpen.value = Math.min(1, P * 3)
-    this.leftHinge.rotation.y = open * DOOR_SWING
-    this.rightHinge.rotation.y = open * -DOOR_SWING
-    this.doorCam.position.z = THREE.MathUtils.lerp(DOOR_CAM_Z, -2.6, dolly)
-    this._look.set(0, THREE.MathUtils.lerp(0, -0.6, dolly), THREE.MathUtils.lerp(0, -16, dolly))
+    this.letterMat.uniforms.uOpen.value = Math.min(1, P * 2.5)
+
+    if (this.spinMode === 'free') {
+      // doors open inward and DECELERATE into the 147° cap (reached at ~85% scroll)
+      // instead of slamming into it — so the tagline face, which only clears its own
+      // shadow in the last stretch of that rotation, brightens slowly as it eases to
+      // a stop rather than popping.
+      const u = THREE.MathUtils.clamp(P / 0.85, 0, 1)
+      const ease = u * u * u * (u * (u * 6 - 15) + 10) // smootherstep, flat at both ends
+      const spin = 2.566 * ease
+      this.leftHinge.rotation.y = spin
+      this.rightHinge.rotation.y = -spin
+    } else {
+      // rotate exactly 90° — front face swings away, the inner (tagline) face
+      // comes fully round to the camera — then stop turning
+      const rotP = THREE.MathUtils.clamp(P / 0.4, 0, 1)
+      const spin = (Math.PI / 2) * (rotP * rotP * (3 - 2 * rotP))
+      this.leftHinge.rotation.y = -spin
+      this.rightHinge.rotation.y = spin
+    }
+    this.leftHinge.position.set((-vw / 2) * xPull, 0, fwd)
+    this.rightHinge.position.set((vw / 2) * xPull, 0, fwd)
+
+    // camera holds while the doors open, then eases in on the same curve — slower
+    // than the cubes recede, so they shrink with distance smoothly
+    this.doorCam.position.z = THREE.MathUtils.lerp(DOOR_CAM_Z, -1, f)
+    this._look.set(0, THREE.MathUtils.lerp(0, -0.15, f), THREE.MathUtils.lerp(0, -12, f))
     this.doorCam.lookAt(this._look)
 
     this.crumbs.step(dt)

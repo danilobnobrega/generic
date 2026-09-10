@@ -5,7 +5,8 @@
   "type": "module",
   "description": "GENERIC. We do things for people.",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --port 5181 --strictPort",
+    "dev:spin": "vite --port 5182 --strictPort --mode spin",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit"

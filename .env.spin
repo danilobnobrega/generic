@@ -1,0 +1,1 @@
+VITE_HERO_MODE=spin

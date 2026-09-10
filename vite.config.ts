@@ -7,7 +7,9 @@ export default defineConfig({
   // instead of silently serving index.html
   appType: 'mpa',
   server: {
-    port: 5180,
+    // `npm run dev` -> :5181 (90° cap), `npm run dev:spin` -> :5182 (free spin);
+    // the port is read in main.ts. Both flags come from the package.json scripts.
+    port: 5181,
     open: false,
   },
   build: {
