@@ -293,6 +293,7 @@ export class ShaderHero {
    */
   private buildLetterMaterial(): void {
     this.letterMat = new THREE.ShaderMaterial({
+      side: THREE.DoubleSide, // cut caps have arbitrary winding; also hides any thin seam crack
       uniforms: {
         uField: { value: this.rtA.texture },
         uOpen: { value: 0 },
@@ -357,6 +358,123 @@ export class ShaderHero {
     }
   }
 
+  /**
+   * Split an extruded-text geometry by the plane x = 0 into two closed halves.
+   * Triangles that straddle the plane are clipped (clean vertical seam, not a
+   * ragged triangle-bucket edge) and each half gets a flat cap on the cut so the
+   * bisected glyph reads as solid, not hollow.
+   */
+  private bisect(geo: THREE.BufferGeometry): [THREE.BufferGeometry, THREE.BufferGeometry] {
+    const src = geo.index ? geo.toNonIndexed() : geo
+    const P = src.attributes.position.array
+    const N = src.attributes.normal.array
+
+    const L: number[] = []
+    const Ln: number[] = []
+    const R: number[] = []
+    const Rn: number[] = []
+    const cut: number[] = [] // segments on x=0: [y1,z1,y2,z2,...]
+
+    const fan = (arr: number[], narr: number[], poly: number[][]): void => {
+      for (let i = 1; i < poly.length - 1; i++) {
+        for (const v of [poly[0], poly[i], poly[i + 1]]) {
+          arr.push(v[0], v[1], v[2])
+          narr.push(v[3], v[4], v[5])
+        }
+      }
+    }
+
+    for (let t = 0; t < P.length; t += 9) {
+      const v = [0, 1, 2].map((k) => [
+        P[t + k * 3], P[t + k * 3 + 1], P[t + k * 3 + 2],
+        N[t + k * 3], N[t + k * 3 + 1], N[t + k * 3 + 2],
+      ])
+      const lp: number[][] = []
+      const rp: number[][] = []
+      const onPlane: number[][] = []
+      for (let i = 0; i < 3; i++) {
+        const a = v[i]
+        const b = v[(i + 1) % 3]
+        if (a[0] <= 1e-6) lp.push(a)
+        if (a[0] >= -1e-6) rp.push(a)
+        if ((a[0] < 0 && b[0] > 0) || (a[0] > 0 && b[0] < 0)) {
+          const s = a[0] / (a[0] - b[0])
+          const m = a.map((av, k) => av + s * (b[k] - av))
+          m[0] = 0
+          lp.push(m)
+          rp.push(m)
+          onPlane.push(m)
+        }
+      }
+      if (lp.length >= 3) fan(L, Ln, lp)
+      if (rp.length >= 3) fan(R, Rn, rp)
+      if (onPlane.length === 2) cut.push(onPlane[0][1], onPlane[0][2], onPlane[1][1], onPlane[1][2])
+    }
+
+    // cap the cut: chain the boundary segments into closed loops (a glyph like E
+    // gives several disjoint loops) and fan each one on its own — a single global
+    // fan would bridge the gaps and leave stray webs poking off the seam.
+    const q = (y: number, z: number): string => `${Math.round(y * 1e4)}_${Math.round(z * 1e4)}`
+    const segs: number[][] = []
+    for (let i = 0; i < cut.length; i += 4) segs.push([cut[i], cut[i + 1], cut[i + 2], cut[i + 3]])
+    const byKey = new Map<string, number[]>()
+    segs.forEach((s, i) => {
+      for (const k of [q(s[0], s[1]), q(s[2], s[3])]) {
+        if (!byKey.has(k)) byKey.set(k, [])
+        byKey.get(k)!.push(i)
+      }
+    })
+    const unused = new Set(segs.map((_, i) => i))
+    while (unused.size) {
+      const start = unused.values().next().value as number
+      unused.delete(start)
+      const loop: number[][] = [
+        [segs[start][0], segs[start][1]],
+        [segs[start][2], segs[start][3]],
+      ]
+      const startKey = q(segs[start][0], segs[start][1])
+      let curKey = q(segs[start][2], segs[start][3])
+      for (let guard = 0; curKey !== startKey && guard < 5000; guard++) {
+        const next = (byKey.get(curKey) ?? []).find((i) => unused.has(i))
+        if (next === undefined) break
+        unused.delete(next)
+        const s = segs[next]
+        const near = q(s[0], s[1]) === curKey
+        loop.push(near ? [s[2], s[3]] : [s[0], s[1]])
+        curKey = q(near ? s[2] : s[0], near ? s[3] : s[1])
+      }
+      if (loop.length < 3) continue
+      let cy = 0
+      let cz = 0
+      for (const [y, z] of loop) {
+        cy += y
+        cz += z
+      }
+      cy /= loop.length
+      cz /= loop.length
+      for (let i = 0; i < loop.length; i++) {
+        const [y1, z1] = loop[i]
+        const [y2, z2] = loop[(i + 1) % loop.length]
+        L.push(0, cy, cz, 0, y2, z2, 0, y1, z1)
+        R.push(0, cy, cz, 0, y1, z1, 0, y2, z2)
+        for (let j = 0; j < 3; j++) {
+          Ln.push(-1, 0, 0)
+          Rn.push(1, 0, 0)
+        }
+      }
+    }
+
+    if (src !== geo) src.dispose()
+
+    const g = (p: number[], nn: number[]): THREE.BufferGeometry => {
+      const bg = new THREE.BufferGeometry()
+      bg.setAttribute('position', new THREE.Float32BufferAttribute(p, 3))
+      bg.setAttribute('normal', new THREE.Float32BufferAttribute(nn, 3))
+      return bg
+    }
+    return [g(L, Ln), g(R, Rn)]
+  }
+
   private disposeLetters(): void {
     for (const grp of [this.lettersL, this.lettersR]) {
       for (const child of [...grp.children]) {
@@ -398,37 +516,19 @@ export class ShaderHero {
     const bb = geo.boundingBox!
     const halfW = (bb.max.x - bb.min.x) / 2
     const halfH = (bb.max.y - bb.min.y) / 2
+
     // lockup centre -> origin; extrusion runs z 0..depth so the back sits on the panel
     geo.translate(-(bb.max.x + bb.min.x) / 2, -(bb.max.y + bb.min.y) / 2, 0)
 
-    // split triangles at x = 0 so each half rides its own leaf
-    const tri = geo.toNonIndexed()
-    const p = tri.attributes.position.array as Float32Array
-    const nr = tri.attributes.normal.array as Float32Array
-    const buf: Record<'L' | 'R', { p: number[]; n: number[] }> = { L: { p: [], n: [] }, R: { p: [], n: [] } }
-    for (let t = 0; t < p.length; t += 9) {
-      const side = (p[t] + p[t + 3] + p[t + 6]) / 3 < 0 ? buf.L : buf.R
-      for (let k = 0; k < 9; k++) {
-        side.p.push(p[t + k])
-        side.n.push(nr[t + k])
-      }
-    }
+    const [gl, gr] = this.bisect(geo)
     geo.dispose()
-    tri.dispose()
-
-    const half = (d: { p: number[]; n: number[] }): THREE.BufferGeometry => {
-      const g = new THREE.BufferGeometry()
-      g.setAttribute('position', new THREE.Float32BufferAttribute(d.p, 3))
-      g.setAttribute('normal', new THREE.Float32BufferAttribute(d.n, 3))
-      return g
-    }
 
     const yOff = vh * 0.03
     const zOff = 0.015
-    const meshL = new THREE.Mesh(half(buf.L), this.letterMat)
+    const meshL = new THREE.Mesh(gl, this.letterMat)
     meshL.position.set(vw / 2, yOff, zOff)
     this.lettersL.add(meshL)
-    const meshR = new THREE.Mesh(half(buf.R), this.letterMat)
+    const meshR = new THREE.Mesh(gr, this.letterMat)
     meshR.position.set(-vw / 2, yOff, zOff)
     this.lettersR.add(meshR)
 
