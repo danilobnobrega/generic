@@ -25,12 +25,12 @@ const DOOR_FOV = 50
 const CRUMB_Z = 2.4
 /** extrusion depth of the sign letters, as a fraction of cap height */
 const LETTER_DEPTH = 0.17
-/** 'free' mode: how far the door-cubes rotate before freezing (radians). 2.129 = 122° */
+/** how far the door-cubes rotate before freezing (radians). 2.129 = 122° */
 const SPIN_CAP = 2.129
-/** 'free' mode: scroll fraction at which the rotation + recede freeze and the camera
- *  starts its forward dive */
+/** scroll fraction at which the rotation + recede freeze and the camera starts its
+ *  forward dive */
 const FREEZE_P = 0.61
-/** 'free' mode: where the camera ends its dive — punched fully past the frozen cubes */
+/** where the camera ends its dive — punched fully past the frozen cubes */
 const CAM_DIVE_END = -17
 /** section 2 — the photo tunnel behind the doors (Floema's recipe) */
 const TUNNEL_ARM_P = 0.99 // turns on once the camera has punched fully past the cubes
@@ -134,8 +134,6 @@ export class ShaderHero {
   private down = 0
   private pointerInside = false
 
-  private spinMode: 'cap' | 'free'
-
   private progress = 0
   private progressTarget = 0
   private manual = 0
@@ -158,8 +156,7 @@ export class ShaderHero {
   private wormSpin = 0 // accumulated disc rotation (radians)
   private wormFlash?: THREE.Mesh // full-view white plane for the arrival white-out
 
-  constructor(canvas: HTMLCanvasElement, opts: { crumbScale?: number; spinMode?: 'cap' | 'free' } = {}) {
-    this.spinMode = opts.spinMode ?? 'cap'
+  constructor(canvas: HTMLCanvasElement, opts: { crumbScale?: number } = {}) {
     this.canvas = canvas
     // Size to the canvas's own laid-out box — and pass the RAW fractional size to
     // setSize. Rounding it here makes the backing store a pixel short of the box,
@@ -209,7 +206,6 @@ export class ShaderHero {
       side: THREE.DoubleSide, // the leaves must stay visible through the whole swing
       uniforms: {
         map: { value: this.heroRT.texture },
-        uPlay: { value: this.spinMode === 'free' ? 1 : 0 }, // light/shadow play only in 'free'
         // 0 -> 1, set in frame(): GENERIC faces fall into shadow on uPhase (fast),
         // the tagline outer faces come up on uPhaseB (slower)
         uPhase: { value: 0 },
@@ -232,14 +228,12 @@ export class ShaderHero {
       fragmentShader: `
         precision highp float;
         uniform sampler2D map;
-        uniform float uPlay;
         uniform float uPhase;
         uniform float uPhaseB;
         varying vec2 vUv;
         varying float vKind;
         void main() {
           vec3 tex = texture2D(map, vUv).rgb;
-          if (uPlay < 0.5) { gl_FragColor = vec4(tex, 1.0); return; }
           float bright = 1.0;
           if (vKind < 0.5) {
             bright = mix(1.0, 0.03, uPhase);   // GENERIC front: full -> deep shadow (fast)
@@ -303,7 +297,7 @@ export class ShaderHero {
     this.doorScene.add(this.leftHinge, this.rightHinge)
     this.buildSpaceBehind()
     this.buildDoors()
-    if (this.spinMode === 'free') this.buildGallery()
+    this.buildGallery()
 
     // the crumb pile — a scaled sub-world planted at CRUMB_Z, in front of the
     // closed doors. Scale maps the crumb ortho view (2·CRUMB_VIEW_H tall) exactly
@@ -316,7 +310,7 @@ export class ShaderHero {
     this.crumbs.layout(this.W / this.H)
 
     this.clearTargets()
-    if (this.spinMode === 'free') this.bakeWormhole()
+    this.bakeWormhole()
     void this.loadFonts().then(() => this.layoutLetters())
 
     window.addEventListener('pointermove', this.onPointerMove)
@@ -409,13 +403,11 @@ export class ShaderHero {
     this.leftPanel = buildLeaf(this.leftHinge, -1)
     this.rightPanel = buildLeaf(this.rightHinge, 1)
 
-    if (this.spinMode === 'free') {
-      this.leftPanel.layers.set(1)
-      this.rightPanel.layers.set(2)
-      for (const p of [this.leftPanel, this.rightPanel]) {
-        p.castShadow = true
-        p.receiveShadow = true
-      }
+    this.leftPanel.layers.set(1)
+    this.rightPanel.layers.set(2)
+    for (const p of [this.leftPanel, this.rightPanel]) {
+      p.castShadow = true
+      p.receiveShadow = true
     }
   }
 
@@ -425,14 +417,7 @@ export class ShaderHero {
     glow.position.set(0, 1.5, -9)
     this.doorScene.add(glow)
 
-    if (this.spinMode !== 'free') {
-      const key = new THREE.DirectionalLight(0xfff4e6, 2.4) // soft key from the camera side
-      key.position.set(3, 4, 7)
-      this.doorScene.add(key, new THREE.HemisphereLight(0x45423c, 0x26241f, 0.5))
-      return
-    }
-
-    // 'free' mode: the two door-cubes are lit ONLY by the lights below — nothing else
+    // the two door-cubes are lit ONLY by the lights below — nothing else
     // in the scene (not the glow, not the room fill) can spill onto them. That's what
     // the layers are for: the left panel + its tagline are on layer 1, the right on
     // layer 2, and each key light + the fill match. Each outer (tagline) face is
@@ -959,8 +944,7 @@ export class ShaderHero {
     we.position.set(vw / 2 - halfW + size * 0.03, yOff + halfH + size * 0.06, zOff)
     this.lettersL.add(we)
 
-    // tagline — 'free' mode: on the cube's BACK face (the one that faces the
-    // camera at the 147° cap). 'cap' mode: on the inner/seam face (shows at 90°).
+    // tagline — on the cube's outer face, revealed once the cube has turned far enough
     const cs = this.cubeSide
     const cxL = cs / 2 - vw * 0.006 // left cube centre offset inside its hinge (matches buildLeaf)
     const tagW = cs * 0.7
@@ -987,23 +971,16 @@ export class ShaderHero {
 
     const tagL = makeTag('We do things')
     const tagR = makeTag('for people.')
-    if (this.spinMode === 'free') {
-      // left cube: on its -x (outer) face, facing -x, just outside it.
-      tagL.material = this.tagMatL // self-contained, same key/gate as the face, darker albedo
-      tagL.rotation.y = -Math.PI / 2
-      tagL.position.set(cxL - cs / 2 - 0.05, yOff, -cs / 2)
-      tagL.layers.set(1)
-      // right cube: mirror — on its +x (outer) face
-      tagR.material = this.tagMatR
-      tagR.rotation.y = Math.PI / 2
-      tagR.position.set(-(cxL - cs / 2 - 0.05), yOff, -cs / 2)
-      tagR.layers.set(2)
-    } else {
-      tagL.rotation.y = Math.PI / 2 // inner (seam) face
-      tagL.position.set(vw / 2 - 0.02, yOff, -cs / 2)
-      tagR.rotation.y = -Math.PI / 2
-      tagR.position.set(-vw / 2 + 0.02, yOff, -cs / 2)
-    }
+    // left cube: on its -x (outer) face, facing -x, just outside it.
+    tagL.material = this.tagMatL // self-contained, same key/gate as the face, darker albedo
+    tagL.rotation.y = -Math.PI / 2
+    tagL.position.set(cxL - cs / 2 - 0.05, yOff, -cs / 2)
+    tagL.layers.set(1)
+    // right cube: mirror — on its +x (outer) face
+    tagR.material = this.tagMatR
+    tagR.rotation.y = Math.PI / 2
+    tagR.position.set(-(cxL - cs / 2 - 0.05), yOff, -cs / 2)
+    tagR.layers.set(2)
     this.lettersL.add(tagL)
     this.lettersR.add(tagR)
   }
@@ -1073,77 +1050,59 @@ export class ShaderHero {
     const vh = 2 * DOOR_CAM_Z * Math.tan(THREE.MathUtils.degToRad(DOOR_FOV / 2))
     const vw = vh * (this.W / this.H)
 
-    const fly = THREE.MathUtils.clamp((P - 0.3) / 0.7, 0, 1)
-    const f = fly * fly // gentle ease-in — no lurch when they launch (cap mode)
-
-    // free mode: one shared curve drives the rotation AND the recede, so the cubes
-    // turn and pull back together from the first frame (not spin-then-slide). Reaches
-    // 1 at FREEZE_P (the SPIN_CAP / frozen frame), smootherstep so it eases to a stop.
+    // one shared curve drives the rotation AND the recede, so the cubes turn and
+    // pull back together from the first frame (not spin-then-slide). Reaches 1 at
+    // FREEZE_P (the SPIN_CAP / frozen frame), smootherstep so it eases to a stop.
     const du = THREE.MathUtils.clamp(P / FREEZE_P, 0, 1)
     const doorE = du * du * du * (du * (du * 6 - 15) + 10)
 
-    const fwd = this.spinMode === 'free' ? -doorE * 9 : -f * 13
-    // 'free' mode: NO inward drift — it made the two halves of the split wordmark
-    // (and the two cube faces) converge and overlap at the seam as the scroll began.
-    // Perspective shrink alone keeps the receding cubes framed.
-    const xPull = this.spinMode === 'free' ? 1 : 1 - f * 0.3
+    const fwd = -doorE * 9
+    // NO inward drift — it made the two halves of the split wordmark (and the two
+    // cube faces) converge and overlap at the seam as the scroll began. Perspective
+    // shrink alone keeps the receding cubes framed.
+    const xPull = 1
 
     this.letterMat.uniforms.uField.value = this.rtA.texture
     this.letterMat.uniforms.uOpen.value = Math.min(1, P * 2.5)
 
-    if (this.spinMode === 'free') {
-      // rotation rides the same curve as the recede (doorE) and decelerates into
-      // SPIN_CAP at FREEZE_P instead of slamming into it
-      const spin = SPIN_CAP * doorE
-      this.leftHinge.rotation.y = spin
-      this.rightHinge.rotation.y = -spin
-      // feed each tagline text material the world normal of the flat face it gates
-      // on (left: -x rotated; right: +x rotated the other way)
-      const cs = Math.cos(spin)
-      const sn = Math.sin(spin)
-      this.tagMatL.uniforms.uFaceN.value.set(-cs, 0, sn)
-      this.tagMatR.uniforms.uFaceN.value.set(cs, 0, sn)
-      // light/shadow play, tied to the rotation: GENERIC drops into full shadow FAST
-      // and is completely dark well before the tagline (+ its text) comes up slowly,
-      // so the two are never legible at once
-      const deg = (spin * 180) / Math.PI
-      const dark = THREE.MathUtils.smoothstep(deg, 52, 70)
-      const bright = THREE.MathUtils.smoothstep(deg, 80, 122)
-      this.doorMat.uniforms.uPhase.value = dark
-      this.doorMat.uniforms.uPhaseB.value = bright
-      this.letterMat.uniforms.uPhase.value = dark
-      this.tagMatL.uniforms.uReveal.value = bright
-      this.tagMatR.uniforms.uReveal.value = bright
-    } else {
-      // rotate exactly 90° — front face swings away, the inner (tagline) face
-      // comes fully round to the camera — then stop turning
-      const rotP = THREE.MathUtils.clamp(P / 0.4, 0, 1)
-      const spin = (Math.PI / 2) * (rotP * rotP * (3 - 2 * rotP))
-      this.leftHinge.rotation.y = -spin
-      this.rightHinge.rotation.y = spin
-    }
+    // rotation rides the same curve as the recede (doorE) and decelerates into
+    // SPIN_CAP at FREEZE_P instead of slamming into it
+    const spin = SPIN_CAP * doorE
+    this.leftHinge.rotation.y = spin
+    this.rightHinge.rotation.y = -spin
+    // feed each tagline text material the world normal of the flat face it gates
+    // on (left: -x rotated; right: +x rotated the other way)
+    const cs = Math.cos(spin)
+    const sn = Math.sin(spin)
+    this.tagMatL.uniforms.uFaceN.value.set(-cs, 0, sn)
+    this.tagMatR.uniforms.uFaceN.value.set(cs, 0, sn)
+    // light/shadow play, tied to the rotation: GENERIC drops into full shadow FAST
+    // and is completely dark well before the tagline (+ its text) comes up slowly,
+    // so the two are never legible at once
+    const deg = (spin * 180) / Math.PI
+    const dark = THREE.MathUtils.smoothstep(deg, 52, 70)
+    const bright = THREE.MathUtils.smoothstep(deg, 80, 122)
+    this.doorMat.uniforms.uPhase.value = dark
+    this.doorMat.uniforms.uPhaseB.value = bright
+    this.letterMat.uniforms.uPhase.value = dark
+    this.tagMatL.uniforms.uReveal.value = bright
+    this.tagMatR.uniforms.uReveal.value = bright
+
     this.leftHinge.position.set((-vw / 2) * xPull, 0, fwd)
     this.rightHinge.position.set((vw / 2) * xPull, 0, fwd)
 
-    if (this.spinMode === 'free') {
-      // once the cubes lock (FREEZE_P) the camera eases forward toward them — the
-      // approved shot that lets you take in the revealed tagline up close (settles
-      // ~z -4 by 90% scroll) — then in the last stretch it PUNCHES through the gap
-      // into the tunnel.
-      const d1 = THREE.MathUtils.clamp((P - FREEZE_P) / (0.9 - FREEZE_P), 0, 1)
-      const d2 = THREE.MathUtils.clamp((P - 0.9) / 0.1, 0, 1)
-      const camZ = THREE.MathUtils.lerp(DOOR_CAM_Z, -4, d1 * (2 - d1)) + Math.pow(d2, 2.2) * (CAM_DIVE_END + 4)
-      this.doorCam.position.z = camZ
-      this._look.set(0, 0, camZ - 10) // always straight ahead
-      this.doorCam.lookAt(this._look)
+    // once the cubes lock (FREEZE_P) the camera eases forward toward them — the
+    // approved shot that lets you take in the revealed tagline up close (settles
+    // ~z -4 by 90% scroll) — then in the last stretch it PUNCHES through the gap
+    // into the tunnel.
+    const d1 = THREE.MathUtils.clamp((P - FREEZE_P) / (0.9 - FREEZE_P), 0, 1)
+    const d2 = THREE.MathUtils.clamp((P - 0.9) / 0.1, 0, 1)
+    const camZ = THREE.MathUtils.lerp(DOOR_CAM_Z, -4, d1 * (2 - d1)) + Math.pow(d2, 2.2) * (CAM_DIVE_END + 4)
+    this.doorCam.position.z = camZ
+    this._look.set(0, 0, camZ - 10) // always straight ahead
+    this.doorCam.lookAt(this._look)
 
-      this.stepGallery(dt, P, camZ)
-    } else {
-      // cap mode: camera holds while the doors open, then eases in on the same curve
-      this.doorCam.position.z = THREE.MathUtils.lerp(DOOR_CAM_Z, -1, f)
-      this._look.set(0, THREE.MathUtils.lerp(0, -0.15, f), THREE.MathUtils.lerp(0, -12, f))
-      this.doorCam.lookAt(this._look)
-    }
+    this.stepGallery(dt, P, camZ)
 
     this.crumbs.step(dt)
 
@@ -1371,7 +1330,7 @@ export class ShaderHero {
 
   private onWheel = (e: WheelEvent): void => {
     if (this.locked || this.inWormhole) return
-    if (this.spinMode === 'free' && this.manual >= 1) {
+    if (this.manual >= 1) {
       // hero scroll is spent — every flick (either direction) feeds the tunnel speed
       // AND charges the wormhole; decays fast, so the RATE of flicking sets both.
       this.tunnelScroll = Math.min(6, this.tunnelScroll + Math.abs(e.deltaY) * 0.0016)
@@ -1392,7 +1351,7 @@ export class ShaderHero {
     const step: Record<string, number> = { ArrowDown: 0.07, PageDown: 0.22, ' ': 0.22, ArrowUp: -0.07, PageUp: -0.22 }
     const s = step[e.key]
     if (s === undefined) return
-    if (this.spinMode === 'free' && this.manual >= 1) {
+    if (this.manual >= 1) {
       this.tunnelScroll = Math.min(6, this.tunnelScroll + Math.abs(s) * 3)
       return
     }
