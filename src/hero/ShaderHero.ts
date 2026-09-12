@@ -6,6 +6,7 @@ import fullscreenVert from './shaders/fullscreen.vert'
 import fieldFrag from './shaders/field.frag'
 import paperFrag from './shaders/paper.frag'
 import galaxyFrag from './shaders/galaxy.frag'
+import beyondFrag from './shaders/beyond.frag'
 import { CrumbRain, CRUMB_VIEW_H } from '../ui/CrumbRain'
 
 const LOCKUP_FRACTION_DESKTOP = 0.82
@@ -35,12 +36,12 @@ const CAM_DIVE_END = -17
 /** section 2 — the photo tunnel behind the doors (Floema's recipe) */
 const TUNNEL_ARM_P = 0.99 // turns on once the camera has punched fully past the cubes
 const TUNNEL_REVEAL_P = 0.55 // photos start appearing one at a time just before the zoom-in
-const TUNNEL_STAGGER = 0.14 // seconds between each photo's fade-in (random order)
+const TUNNEL_STAGGER = 0.085 // seconds between each photo's fade-in (random order)
 const TUNNEL_RADIUS = 10 // photos ride a circle of this radius around the forward axis
-const TUNNEL_SPACING = 2 // z-gap between photos
+const TUNNEL_SPACING = 1.4 // z-gap between photos
 const TUNNEL_FOG_FAR = 78 // photos dissolve into the dark by this distance (tunnel running)
 const TUNNEL_FOG_INTRO = 210 // fog pushed back during the one-by-one reveal so it reads
-const TUNNEL_PLANES = 44 // enough to fill the corridor + a buffer
+const TUNNEL_PLANES = 72 // enough to fill the corridor + a buffer — denser, so it doesn't feel sparse at high speed
 const TUNNEL_IMG_SIZE = 1.5
 const TUNNEL_SCALE_RAND = 0.5
 const TUNNEL_SPEED_WARP = 240 // units/sec burst the instant the tunnel arms
@@ -50,13 +51,25 @@ const TUNNEL_SCROLL_BOOST = 60 // extra units/sec per unit of accumulated scroll
 
 /** section 2 — the wormhole. Sustained fast scrolling inside the armed tunnel
  *  builds a charge; easing off bleeds it away fast (but not instantly — a 0.5s
- *  pause costs real ground). Hold it pinned at full and it locks: from there the
- *  ride to the other side is automatic and scroll is ignored. */
-const WARP_SCROLL_THRESH = 2.2 // tunnelScroll above this counts as "scrolling hard"
-const WARP_CHARGE_TIME = 2.6 // seconds of hard scroll to fill the charge from empty
+ *  pause costs real ground). This first stretch — up to WORM_STREAK_ON, where the
+ *  hyperspace streaks take over — is the hard, scroll-driven part. Past that it's
+ *  WORM_AUTO_TIME of automatic charging: the streaks appearing IS the promise that
+ *  you've earned the rest of the ride, so scroll stops being required. Hold it
+ *  pinned at full and it locks: from there the fall itself is also automatic. */
+const WARP_SCROLL_THRESH = 0.9 // tunnelScroll above this counts as "scrolling hard" — reachable by a mouse wheel's fewer, larger notches, not just a trackpad's fast stream
+const WARP_CHARGE_TIME = 2.6 // seconds of hard scroll to fill the charge from empty, at full commitment
 const WARP_DISCHARGE_TIME = 0.9 // seconds to bleed a full charge back to empty when you ease off
 const WARP_HOLD_TIME = 0.6 // seconds pinned at full charge before the wormhole locks
-const WARP_CHARGE_SPEED = 520 // extra tunnel units/sec at full charge — the rush as it forms
+const WARP_CHARGE_SPEED = 780 // extra tunnel units/sec at full charge — the rush as it forms
+const WORM_AUTO_TIME = 3.5 // seconds to auto-finish the charge once the streaks appear
+// "commitment" — charging rewards several distinct scroll pushes, not one powerful
+// held scroll. A gap of WORM_GESTURE_GAP since the last wheel input starts counting
+// the next one as a NEW push; one continuous scroll (any length, any speed) only
+// ever counts as a single push and charges at WORM_GESTURE_FLOOR speed.
+const WORM_GESTURE_GAP = 0.15 // seconds of quiet that starts a new push
+const WORM_GESTURE_DECAY = 2.4 // seconds for one counted push to fade away
+const WORM_GESTURE_NEEDED = 10 // distinct recent pushes for full-speed charging
+const WORM_GESTURE_FLOOR = 0.12 // charging speed with only a single continuous push
 const WARP_FOV_GAIN = 14 // degrees the camera fov widens at full charge
 const WORMHOLE_DURATION = 3.4 // seconds of automatic fall through the throat once it locks
 const WORMHOLE_SPEED = 650 // photo-suck rush speed during the fall
@@ -67,6 +80,35 @@ const WORM_SCALE_NEAR = 8
 const WORM_TILT = 0.34 // radians the disc leans back — the near-face-on 3D read of the ref
 const WORM_SPIN_BASE = 0.06 // rad/sec the galaxy turns at rest
 const WORM_RT_SIZE = 1024 // baked galaxy texture resolution
+// the chapter tunnel — what's beyond the wormhole (placeholder destination, TBD).
+// One tube, one shader, four looks crossfading in sequence: dark faceted metal,
+// green digital grid, purple fractal energy, red fractal energy. Fully automatic.
+// The tube is a real winding path (TubeGeometry along a closed, wavy curve) that
+// the camera actually travels — a straight tube centred on the camera looks dead
+// ahead into a black hole (no wall lies exactly on the view axis) and can't be
+// sinuous either; a real curved path fixes both at once.
+const BEYOND_TUBE_R = 5 // tube radius
+const BEYOND_BASE_R = 110 // the loop's base radius — big, so the curl doesn't read as an obvious circle, and long enough that a fast camera doesn't lap it mid-ride
+const BEYOND_SEGMENTS = 500 // tubular segments along the curve
+const BEYOND_SPEED = 55 // units/sec the camera travels along the path
+const TUNNEL_CH_COUNT = 4
+const TUNNEL_CH_DURATION = 3.0 // seconds per chapter
+const TUNNEL_CH_BLEND = 0.9 // seconds of crossfade into the next chapter, at the end of each
+// the hyperspace streak field (below) fades in across this charge window, so it
+// takes over right as the photos are dissolving out
+const WORM_STREAK_ON = 0.42
+const WORM_STREAK_OFF = 0.30
+// the hyperspace streak field — hundreds of tiny dashes scattered around the
+// forward axis (NOT the photo ring), each length driven by its own radius (far
+// off-axis = longer streak, near-centre = a short dash) and by speed
+const WORM_STREAK_COUNT = 900
+const WORM_STREAK_RAD_MIN = 0.5
+const WORM_STREAK_RAD_MAX = 17
+const WORM_STREAK_RANGE = 130 // z depth each dash recycles across
+const WORM_STREAK_WIDTH = 0.028
+const WORM_STREAK_LEN_BASE = 0.05
+const WORM_STREAK_LEN_RAD = 0.11 // extra length per world unit of radius
+const WORM_STREAK_SPEED = 55 // base z advance, scaled up by charge/fall
 
 /**
  * The hero. The off-white ground is a shader (grain + vignette); on it stands a
@@ -141,12 +183,23 @@ export class ShaderHero {
   // section 2 — the photo tunnel
   private gallery = new THREE.Group()
   private galleryPhotos: THREE.Mesh[] = []
+  private streakTex?: THREE.CanvasTexture // plain thin light-dash texture, shared by the streak field
+  private streakField?: THREE.InstancedMesh
+  private streakMat?: THREE.MeshBasicMaterial
+  private streakAngle?: Float32Array
+  private streakRadius?: Float32Array
+  private streakZ?: Float32Array
+  private streakLen?: Float32Array
   private revealClock = -1 // seconds since the one-by-one reveal started (-1 = not started)
   private tunnelTime = -1 // seconds since the tunnel armed (-1 = not armed)
   private tunnelScroll = 0 // 0..1 scroll input, coasts back to 0 -> speed boost on top of idle
   // the wormhole
   private warpCharge = 0 // 0..1 — builds while scrolling hard, bleeds away fast when you ease off
   private warpHold = 0 // seconds pinned at full charge (locks the wormhole at WARP_HOLD_TIME)
+  private wormPulses = 0 // decaying count of distinct recent scroll pushes (commitment, not power)
+  private lastPulseTime = -1 // performance.now()/1000 of the last qualifying scroll input
+  private wormAuto = false // latched once the streaks appear — charging finishes on its own from there
+  private wormAutoStartCharge = 0 // raw warpCharge at the moment autopilot engaged
   private inWormhole = false // locked in — the ride is automatic from here, scroll ignored
   private wormholeTime = 0 // seconds since the wormhole locked
   private arrived = false // reached the other side (undefined for now — ends on black)
@@ -155,6 +208,14 @@ export class ShaderHero {
   private wormRT?: THREE.WebGLRenderTarget // the procedural spiral-galaxy texture, baked once
   private wormSpin = 0 // accumulated disc rotation (radians)
   private wormFlash?: THREE.Mesh // full-view white plane for the arrival white-out
+  private beyondTube?: THREE.Mesh // the chapter tunnel beyond the wormhole
+  private beyondMat?: THREE.ShaderMaterial
+  private beyondCurve?: THREE.CatmullRomCurve3 // the winding path the camera travels
+  private beyondCurveLen = 1 // cached arc length
+  private tunnelT = 0 // 0..1 progress along the path (wraps — the loop is closed)
+  private inTunnel = false // past the wormhole — the chapter tunnel is running, fully automatic
+  private tunnelSeqTime = 0 // seconds since the chapter tunnel started
+  private tunnelEnded = false // one pass through all four chapters done — faded out, holding
 
   constructor(canvas: HTMLCanvasElement, opts: { crumbScale?: number } = {}) {
     this.canvas = canvas
@@ -311,6 +372,7 @@ export class ShaderHero {
 
     this.clearTargets()
     this.bakeWormhole()
+    this.buildBeyondTunnel()
     void this.loadFonts().then(() => this.layoutLetters())
 
     window.addEventListener('pointermove', this.onPointerMove)
@@ -506,6 +568,34 @@ export class ShaderHero {
       tex.minFilter = THREE.LinearFilter
       texes.push(tex)
     }
+
+    // shared dash texture for the hyperspace streak field below — a thin vertical
+    // light bar, bright core fading to transparent at both ends and both sides
+    const streakCnv = document.createElement('canvas')
+    streakCnv.width = 48
+    streakCnv.height = 512
+    const sctx = streakCnv.getContext('2d')!
+    const vgrad = sctx.createLinearGradient(0, 0, 0, 512)
+    vgrad.addColorStop(0.0, 'rgba(200,215,255,0)')
+    vgrad.addColorStop(0.4, 'rgba(215,228,255,0.85)')
+    vgrad.addColorStop(0.5, 'rgba(255,255,255,1)')
+    vgrad.addColorStop(0.6, 'rgba(215,228,255,0.85)')
+    vgrad.addColorStop(1.0, 'rgba(200,215,255,0)')
+    sctx.fillStyle = vgrad
+    sctx.fillRect(0, 0, 48, 512)
+    const hgrad = sctx.createLinearGradient(0, 0, 48, 0)
+    hgrad.addColorStop(0.0, 'rgba(0,0,0,0)')
+    hgrad.addColorStop(0.5, 'rgba(0,0,0,1)')
+    hgrad.addColorStop(1.0, 'rgba(0,0,0,0)')
+    sctx.globalCompositeOperation = 'destination-in'
+    sctx.fillStyle = hgrad
+    sctx.fillRect(0, 0, 48, 512)
+    sctx.globalCompositeOperation = 'source-over'
+    this.streakTex = new THREE.CanvasTexture(streakCnv)
+    this.streakTex.colorSpace = THREE.SRGBColorSpace
+    this.streakTex.generateMipmaps = false
+    this.streakTex.minFilter = THREE.LinearFilter
+
     for (let i = 0; i < TUNNEL_PLANES; i++) {
       const tex = texes[i % NDISTINCT]
       const m = new THREE.Mesh(
@@ -527,6 +617,31 @@ export class ShaderHero {
       this.galleryPhotos.push(m)
       this.gallery.add(m)
     }
+
+    // the hyperspace streak field — hundreds of tiny dashes scattered around the
+    // axis (their own radii, not the photo ring), each a thin sliver of streakTex.
+    // Length is driven by radius (far off-axis = long streak, near-centre = a dot)
+    // and by speed, so it reads as real radial motion, not a uniform blur.
+    this.streakAngle = new Float32Array(WORM_STREAK_COUNT)
+    this.streakRadius = new Float32Array(WORM_STREAK_COUNT)
+    this.streakZ = new Float32Array(WORM_STREAK_COUNT)
+    this.streakLen = new Float32Array(WORM_STREAK_COUNT)
+    for (let i = 0; i < WORM_STREAK_COUNT; i++) {
+      this.streakAngle[i] = rng() * Math.PI * 2
+      this.streakRadius[i] = WORM_STREAK_RAD_MIN + (WORM_STREAK_RAD_MAX - WORM_STREAK_RAD_MIN) * rng()
+      this.streakZ[i] = CAM_DIVE_END - rng() * WORM_STREAK_RANGE
+    }
+    this.streakMat = new THREE.MeshBasicMaterial({
+      map: this.streakTex,
+      transparent: true,
+      depthWrite: false,
+      opacity: 0,
+      blending: THREE.AdditiveBlending,
+    })
+    this.streakField = new THREE.InstancedMesh(geo, this.streakMat, WORM_STREAK_COUNT)
+    this.streakField.frustumCulled = false
+    this.gallery.add(this.streakField)
+
     this.gallery.visible = false
     this.doorScene.add(this.gallery)
     this.doorScene.fog = new THREE.Fog(0x000000, 0.1, TUNNEL_FOG_INTRO)
@@ -618,6 +733,103 @@ export class ShaderHero {
     scene.remove(mesh)
     genMat.dispose()
     if (this.wormTubeMat) this.wormTubeMat.uniforms.uMap.value = this.wormRT.texture
+  }
+
+  /**
+   * The chapter tunnel beyond the wormhole (placeholder destination — TBD). A
+   * real winding path — TubeGeometry along a closed, wavy CatmullRom loop — that
+   * the camera actually travels (a straight tube centred on the camera looks
+   * straight down a black hole with no wall on the view axis, and can't read as
+   * sinuous either). The shader alone sells the chapter changes: four "looks"
+   * crossfading on the very same surface (see beyond.frag) — one continuous
+   * surface is what makes the transitions seamless.
+   */
+  private buildBeyondTunnel(): void {
+    const pts: THREE.Vector3[] = []
+    const N = 24
+    for (let i = 0; i < N; i++) {
+      const a = (i / N) * Math.PI * 2
+      const r = BEYOND_BASE_R + 18 * Math.sin(a * 3.1 + 0.7) + 11 * Math.sin(a * 5.3 + 2.1)
+      const y = 14 * Math.sin(a * 2.2 + 1.3) + 9 * Math.sin(a * 4.7 + 0.4)
+      pts.push(new THREE.Vector3(Math.cos(a) * r, y, Math.sin(a) * r))
+    }
+    this.beyondCurve = new THREE.CatmullRomCurve3(pts, true, 'catmullrom', 0.5)
+    this.beyondCurveLen = this.beyondCurve.getLength()
+
+    const geo = new THREE.TubeGeometry(this.beyondCurve, BEYOND_SEGMENTS, BEYOND_TUBE_R, 24, true)
+    this.beyondMat = new THREE.ShaderMaterial({
+      side: THREE.BackSide,
+      uniforms: {
+        uTime: { value: 0 },
+        uLookA: { value: 0 },
+        uLookB: { value: 1 },
+        uBlend: { value: 0 },
+        uResolution: { value: new THREE.Vector2(...this.bufSize()) },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: beyondFrag,
+    })
+    this.beyondTube = new THREE.Mesh(geo, this.beyondMat)
+    this.beyondTube.visible = false
+    this.beyondTube.frustumCulled = false
+    this.doorScene.add(this.beyondTube)
+  }
+
+  /** the chapter tunnel: fully automatic, no scroll — the camera actually travels
+   *  the winding tube (real curve, not an illusion), while the four looks
+   *  crossfade in sequence on that one shared surface (see beyond.frag) */
+  private stepTunnel(dt: number): void {
+    const tube = this.beyondTube
+    const mat = this.beyondMat
+    const curve = this.beyondCurve
+    if (!tube || !mat || !curve) return
+    tube.visible = true
+
+    this.tunnelSeqTime += dt
+    const onePass = TUNNEL_CH_DURATION * TUNNEL_CH_COUNT
+    const done = this.tunnelSeqTime >= onePass // one trip through all four, then it actually ends
+    const t = Math.min(this.tunnelSeqTime, onePass - 0.001)
+    const idx = Math.min(TUNNEL_CH_COUNT - 1, Math.floor(t / TUNNEL_CH_DURATION))
+    const nextIdx = done ? idx : (idx + 1) % TUNNEL_CH_COUNT
+    const localT = t - idx * TUNNEL_CH_DURATION
+    const blendStart = TUNNEL_CH_DURATION - TUNNEL_CH_BLEND
+    const blend = !done && localT > blendStart ? THREE.MathUtils.smoothstep(localT, blendStart, TUNNEL_CH_DURATION) : 0
+
+    mat.uniforms.uLookA.value = idx
+    mat.uniforms.uLookB.value = nextIdx
+    mat.uniforms.uBlend.value = blend
+    mat.uniforms.uTime.value += dt
+
+    if (!done) {
+      // travel the real curve — the winding is genuine geometry, not a texture
+      // trick, so the camera always has a wall ahead of it (never a straight,
+      // wall-less sightline down the axis) and actually turns with the path
+      this.tunnelT = (this.tunnelT + (BEYOND_SPEED * dt) / this.beyondCurveLen) % 1
+      const pos = curve.getPointAt(this.tunnelT)
+      const ahead = curve.getPointAt((this.tunnelT + 0.006) % 1)
+      this.doorCam.position.copy(pos)
+      this.doorCam.up.set(0, 1, 0)
+      this.doorCam.lookAt(ahead)
+      return
+    }
+
+    // one pass done — it actually ends here (no infinite loop): fade to black and
+    // hold. The other side, past this fade, hasn't been designed yet.
+    const flash = this.wormFlash
+    if (flash) {
+      flash.visible = true
+      ;(flash.material as THREE.MeshBasicMaterial).color.set(0x000000)
+      flash.quaternion.copy(this.doorCam.quaternion)
+      flash.position.set(this.doorCam.position.x, this.doorCam.position.y, this.doorCam.position.z - 0.5)
+      const endT = this.tunnelSeqTime - onePass
+      ;(flash.material as THREE.MeshBasicMaterial).opacity = THREE.MathUtils.clamp(endT / 1.2, 0, 1)
+      if (!this.tunnelEnded && endT >= 1.2) {
+        this.tunnelEnded = true
+        console.info('[hero] chapter tunnel: ended — other side TBD')
+      }
+    }
   }
 
   // ---- the sign -----------------------------------------------------
@@ -1115,6 +1327,10 @@ export class ShaderHero {
    *  then Floema's warp burst -> idle drift + a scroll-RATE speed boost + fog + recycle.
    *  Sustained fast scrolling here charges the wormhole (see stepWormhole). */
   private stepGallery(dt: number, P: number, camZ: number): void {
+    if (this.inTunnel) {
+      this.stepTunnel(dt)
+      return
+    }
     // photos start appearing just before the zoom-in; scrolling back drops them
     if (P < TUNNEL_REVEAL_P - 0.06) this.revealClock = -1
     else if (this.revealClock < 0) this.revealClock = 0
@@ -1135,19 +1351,46 @@ export class ShaderHero {
     // warpCharge; anything less bleeds it away over WARP_DISCHARGE_TIME — fast,
     // but a brief pause doesn't zero it. Pinned at full for WARP_HOLD_TIME it
     // locks and the ride goes automatic.
+    this.wormPulses = Math.max(0, this.wormPulses - dt / WORM_GESTURE_DECAY)
+
     if (!this.inWormhole) {
-      if (armed && this.tunnelScroll > WARP_SCROLL_THRESH) {
-        const over = 1 + (this.tunnelScroll - WARP_SCROLL_THRESH) * 0.35 // scroll harder, fill faster
-        this.warpCharge = Math.min(1, this.warpCharge + (dt / WARP_CHARGE_TIME) * over)
-        this.warpHold = this.warpCharge >= 1 ? this.warpHold + dt : 0
-      } else {
-        this.warpCharge = Math.max(0, this.warpCharge - dt / WARP_DISCHARGE_TIME)
-        this.warpHold = 0
+      // once the charge has already reached WORM_STREAK_ON once (the streaks are
+      // up), the hard part is over — it finishes on its own, scroll or not
+      if (!this.wormAuto) {
+        const ccNow = this.warpCharge * this.warpCharge * (3 - 2 * this.warpCharge)
+        if (ccNow >= WORM_STREAK_ON) {
+          this.wormAuto = true
+          this.wormAutoStartCharge = this.warpCharge
+          console.info('[hero] wormhole: streaks up — autopilot to the throat')
+        }
       }
-      if (this.warpHold >= WARP_HOLD_TIME) {
-        this.inWormhole = true
-        this.wormholeTime = 0
-        console.info('[hero] wormhole: locked')
+      if (this.wormAuto) {
+        // no extra hold here — autopilot is already a deliberate, timed ramp (not
+        // a fluke instant spike), so it locks the moment it reaches full charge
+        // instead of sitting fully-close for another beat first
+        this.warpCharge = Math.min(1, this.warpCharge + dt / WORM_AUTO_TIME)
+        if (this.warpCharge >= 1) {
+          this.inWormhole = true
+          this.wormholeTime = 0
+          console.info('[hero] wormhole: locked')
+        }
+      } else {
+        if (armed && this.tunnelScroll > WARP_SCROLL_THRESH) {
+          const power = 1 + (this.tunnelScroll - WARP_SCROLL_THRESH) * 0.35 // how hard, right now
+          const frac = THREE.MathUtils.clamp((this.wormPulses - 1) / (WORM_GESTURE_NEEDED - 1), 0, 1)
+          const commitment = THREE.MathUtils.lerp(WORM_GESTURE_FLOOR, 1, frac) // how many separate pushes
+          const over = power * commitment
+          this.warpCharge = Math.min(1, this.warpCharge + (dt / WARP_CHARGE_TIME) * over)
+          this.warpHold = this.warpCharge >= 1 ? this.warpHold + dt : 0
+        } else {
+          this.warpCharge = Math.max(0, this.warpCharge - dt / WARP_DISCHARGE_TIME)
+          this.warpHold = 0
+        }
+        if (this.warpHold >= WARP_HOLD_TIME) {
+          this.inWormhole = true
+          this.wormholeTime = 0
+          console.info('[hero] wormhole: locked')
+        }
       }
     }
 
@@ -1186,23 +1429,25 @@ export class ShaderHero {
       this.tunnelTime = -1
     }
 
-    // photos stretch into vertical streaks as the charge builds — "as imagens vão
-    // se distorcendo e passando muito rápido". They stay on their normal ring; the
-    // vortex is the separate thing that grows ahead.
+    // photos stretch gently and fade — radially, along their own direction from the
+    // axis (not just "tall") — as the charge builds, dissolving into the dense
+    // hyperspace streak field (stepStreaks) rather than becoming a big smeared bar
     for (const m of this.galleryPhotos) {
       const revealAt = m.userData.revealAt as number
-      ;(m.material as THREE.MeshBasicMaterial).opacity = THREE.MathUtils.smoothstep(
-        this.revealClock,
-        revealAt,
-        revealAt + 0.4,
-      )
+      const mat = m.material as THREE.MeshBasicMaterial
+      const reveal = THREE.MathUtils.smoothstep(this.revealClock, revealAt, revealAt + 0.4)
+      // fully gone by WORM_STREAK_OFF, the moment the streaks start fading in — a
+      // clean handoff, never both on screen at once
+      mat.opacity = reveal * (1 - THREE.MathUtils.smoothstep(cc, 0.18, WORM_STREAK_OFF))
       if (!armed) m.position.z = m.userData.z0 as number
       const a = m.userData.ang as number
       m.position.x = Math.cos(a) * TUNNEL_RADIUS
       m.position.y = Math.sin(a) * TUNNEL_RADIUS
+      m.rotation.z = a - Math.PI / 2 // "up" (the stretch axis) points radially outward
       const s0 = m.userData.s0 as THREE.Vector3
-      m.scale.set(s0.x * (1 - cc * 0.55), s0.y * (1 + cc * 4.5), 1)
+      m.scale.set(s0.x * (1 - cc * 0.5), s0.y * (1 + cc * 2.5), 1)
     }
+    this.stepStreaks(dt, cc, camZ)
 
     // the vortex, far down the corridor: hidden at rest, and as the charge builds
     // it grows and comes closer — "vê um pequeno buraco de minhoca que vai crescendo
@@ -1211,16 +1456,65 @@ export class ShaderHero {
     worm.visible = armed && cc > 0.004
     if (worm.visible) {
       this.wormSpin += dt * (WORM_SPIN_BASE + cc * 0.6) // spins faster as it energises
+      // while it's still scroll-driven (manual), stay far — a single smooth curve,
+      // no plateau-then-snap. Once autopilot takes over, switch to its OWN 0..1
+      // progress (from the charge level at the moment it engaged, not the global
+      // charge) eased evenly both ends, so the approach spends its whole automatic
+      // stretch actually closing the gap instead of sitting far, then snapping
+      // close, then idling right on top of it.
+      let distT: number
+      if (this.wormAuto) {
+        const autoP = THREE.MathUtils.clamp(
+          (this.warpCharge - this.wormAutoStartCharge) / (1 - this.wormAutoStartCharge),
+          0,
+          1,
+        )
+        distT = autoP * autoP * (3 - 2 * autoP)
+      } else {
+        distT = cc * cc * cc * cc * cc
+      }
       this.placeWorm(
         camZ,
-        THREE.MathUtils.lerp(WORM_DIST_FAR, WORM_DIST_NEAR, cc),
-        THREE.MathUtils.lerp(WORM_SCALE_FAR, WORM_SCALE_NEAR, cc),
+        THREE.MathUtils.lerp(WORM_DIST_FAR, WORM_DIST_NEAR, distT),
+        THREE.MathUtils.lerp(WORM_SCALE_FAR, WORM_SCALE_NEAR, distT),
       )
       this.wormTubeMat!.uniforms.uGrow.value = cc
       this.wormTubeMat!.uniforms.uBloom.value = 0
     }
 
     this.setDoorFov(THREE.MathUtils.lerp(DOOR_FOV, DOOR_FOV + WARP_FOV_GAIN, cc))
+  }
+
+  /** the hyperspace streak field: hundreds of small dashes at their own radii,
+   *  each advancing along z and recycling independently. Fades in across the
+   *  WORM_STREAK_OFF..ON window as the charge builds, full strength during the
+   *  fall (cc === 1 from stepWormhole). */
+  private stepStreaks(dt: number, cc: number, camZ: number): void {
+    const field = this.streakField
+    const angle = this.streakAngle
+    const radius = this.streakRadius
+    const z = this.streakZ
+    const len = this.streakLen
+    if (!field || !angle || !radius || !z || !len) return
+
+    const opacity = THREE.MathUtils.smoothstep(cc, WORM_STREAK_OFF, WORM_STREAK_ON)
+    this.streakMat!.opacity = opacity
+    field.visible = opacity > 0.003
+    if (!field.visible) return
+
+    const speed = WORM_STREAK_SPEED * (0.4 + cc * 2.6)
+    const dummy = new THREE.Object3D()
+    for (let i = 0; i < WORM_STREAK_COUNT; i++) {
+      z[i] += speed * dt
+      if (z[i] > camZ) z[i] -= WORM_STREAK_RANGE
+      len[i] = WORM_STREAK_LEN_BASE + radius[i] * WORM_STREAK_LEN_RAD * (0.3 + cc * 1.4)
+      dummy.position.set(Math.cos(angle[i]) * radius[i], Math.sin(angle[i]) * radius[i], z[i])
+      dummy.rotation.set(0, 0, angle[i] - Math.PI / 2)
+      dummy.scale.set(WORM_STREAK_WIDTH, len[i], 1)
+      dummy.updateMatrix()
+      field.setMatrixAt(i, dummy.matrix)
+    }
+    field.instanceMatrix.needsUpdate = true
   }
 
   /** sit the galaxy disc `dist` ahead of the camera, leaning back by WORM_TILT and
@@ -1262,7 +1556,8 @@ export class ShaderHero {
       this.gallery.visible = false
     }
 
-    // photos pulled into the centre and gone
+    // photos pulled into the centre and gone — the hyperspace streak field (below)
+    // is the only thing selling speed by now, photos are already invisible
     const suck = THREE.MathUtils.smoothstep(t, 0, 1.1)
     for (const m of this.galleryPhotos) {
       const a = (m.userData.ang as number) + dt * (2 + suck * 7)
@@ -1271,10 +1566,12 @@ export class ShaderHero {
       m.position.x = Math.cos(a) * r
       m.position.y = Math.sin(a) * r
       m.position.z += (200 + suck * WORMHOLE_SPEED * 2) * dt
+      m.rotation.z = a - Math.PI / 2
       ;(m.material as THREE.MeshBasicMaterial).opacity = Math.max(0, 1 - suck * 1.3)
     }
+    this.stepStreaks(dt, 1, camZ)
 
-    // hard white at the peak of the bloom, then fall away to black (other side TBD)
+    // hard white at the peak of the bloom, then fall away into the chapter tunnel
     flash.visible = true
     flash.quaternion.copy(this.doorCam.quaternion)
     flash.position.set(this.doorCam.position.x, this.doorCam.position.y, this.doorCam.position.z - 0.5)
@@ -1286,7 +1583,10 @@ export class ShaderHero {
       flash.visible = false
       if (!this.arrived) {
         this.arrived = true
-        console.info('[hero] wormhole: arrived — other side TBD')
+        this.inTunnel = true
+        this.tunnelSeqTime = 0
+        this.gallery.visible = false
+        console.info('[hero] wormhole: arrived — entering the chapter tunnel')
       }
     }
   }
@@ -1328,12 +1628,26 @@ export class ShaderHero {
     this.locked = false
   }
 
+  /** counts a scroll "push" toward the wormhole charge — a gap of WORM_GESTURE_GAP
+   *  since the last qualifying input means this is a NEW push, not a continuation
+   *  of the same scroll. One long scroll only ever counts as a single push, however
+   *  fast or long it runs. Uses wall-clock time — never the render clock, which
+   *  frame() alone is allowed to advance. */
+  private notePulse(): void {
+    const now = performance.now() / 1000
+    if (this.lastPulseTime < 0 || now - this.lastPulseTime > WORM_GESTURE_GAP) {
+      this.wormPulses = Math.min(WORM_GESTURE_NEEDED + 2, this.wormPulses + 1)
+    }
+    this.lastPulseTime = now
+  }
+
   private onWheel = (e: WheelEvent): void => {
     if (this.locked || this.inWormhole) return
     if (this.manual >= 1) {
       // hero scroll is spent — every flick (either direction) feeds the tunnel speed
       // AND charges the wormhole; decays fast, so the RATE of flicking sets both.
       this.tunnelScroll = Math.min(6, this.tunnelScroll + Math.abs(e.deltaY) * 0.0016)
+      if (Math.abs(e.deltaY) > 4) this.notePulse()
       return
     }
     this.manual = THREE.MathUtils.clamp(this.manual + e.deltaY / 2600, 0, 1)
@@ -1353,6 +1667,7 @@ export class ShaderHero {
     if (s === undefined) return
     if (this.manual >= 1) {
       this.tunnelScroll = Math.min(6, this.tunnelScroll + Math.abs(s) * 3)
+      this.notePulse()
       return
     }
     this.manual = THREE.MathUtils.clamp(this.manual + s, 0, 1)
@@ -1377,6 +1692,7 @@ export class ShaderHero {
     this.clearTargets()
     this.heroMat.uniforms.uResolution.value.set(bw, bh)
     this.heroMat.uniforms.uViewAspect.value = bw / bh
+    this.beyondMat?.uniforms.uResolution.value.set(bw, bh)
     this.doorCam.aspect = this.W / this.H
     this.doorCam.updateProjectionMatrix()
     this.buildDoors()
